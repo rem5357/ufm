@@ -1,0 +1,278 @@
+//! UFM - Universal File Manager
+//!
+//! A cross-platform MCP server for file management operations.
+//!
+//! Usage:
+//!   ufm                    # Start with default config
+//!   ufm --config path.toml # Start with custom config
+//!   ufm --init             # Generate default config file
+//!   ufm --help             # Show help
+
+mod archive;
+mod crawler;
+mod mcp;
+mod operations;
+mod platform;
+mod security;
+mod tools;
+
+use std::path::PathBuf;
+
+use clap::Parser;
+use serde::{Deserialize, Serialize};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::mcp::run_stdio_server;
+use crate::security::SecurityPolicy;
+use crate::tools::UfmServer;
+
+/// Build number from BUILD file
+const BUILD_NUMBER: &str = env!("UFM_BUILD_NUMBER");
+
+/// Full version string including build number
+fn full_version() -> String {
+    format!("{} (build {})", env!("CARGO_PKG_VERSION"), BUILD_NUMBER)
+}
+
+/// Command line arguments
+#[derive(Parser, Debug)]
+#[command(name = "ufm")]
+#[command(author = "Robert")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(about = "Universal File Manager - Cross-platform MCP file management")]
+struct Args {
+    /// Path to configuration file
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
+    /// Generate a default configuration file
+    #[arg(long)]
+    init: bool,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+/// Configuration for UFM
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Config {
+    /// Server name shown to MCP clients
+    #[serde(default = "default_name")]
+    name: String,
+
+    /// Server version
+    #[serde(default = "default_version")]
+    version: String,
+
+    /// Security settings
+    #[serde(default)]
+    security: SecurityConfig,
+
+    /// Logging settings
+    #[serde(default)]
+    logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SecurityConfig {
+    /// Allowed root directories (empty = user's home directory)
+    #[serde(default)]
+    allowed_roots: Vec<PathBuf>,
+
+    /// Explicitly denied paths
+    #[serde(default)]
+    denied_paths: Vec<PathBuf>,
+
+    /// Denied path patterns (glob)
+    #[serde(default)]
+    denied_patterns: Vec<String>,
+
+    /// Allow write operations
+    #[serde(default = "default_true")]
+    allow_writes: bool,
+
+    /// Allow delete operations
+    #[serde(default = "default_true")]
+    allow_deletes: bool,
+
+    /// Allow permission changes
+    #[serde(default = "default_true")]
+    allow_chmod: bool,
+
+    /// Maximum file size to read (bytes)
+    #[serde(default = "default_max_read_size")]
+    max_read_size: u64,
+
+    /// Maximum recursion depth
+    #[serde(default = "default_max_depth")]
+    max_recursion_depth: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LoggingConfig {
+    /// Log level (error, warn, info, debug, trace)
+    #[serde(default = "default_log_level")]
+    level: String,
+
+    /// Log to file
+    #[serde(default)]
+    file: Option<PathBuf>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            file: None,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            name: default_name(),
+            version: default_version(),
+            security: SecurityConfig::default(),
+            logging: LoggingConfig::default(),
+        }
+    }
+}
+
+fn default_name() -> String {
+    "UFM".to_string()
+}
+fn default_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_max_read_size() -> u64 {
+    100 * 1024 * 1024
+} // 100MB
+fn default_max_depth() -> u32 {
+    50
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+impl Config {
+    /// Load configuration from file
+    fn load(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string(path)?;
+        let config: Config = toml::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// Save configuration to file
+    fn save(&self, path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+        let content = toml::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Convert to security policy
+    fn to_security_policy(&self) -> SecurityPolicy {
+        let mut policy = if self.security.allowed_roots.is_empty() {
+            SecurityPolicy::permissive()
+        } else {
+            SecurityPolicy::new(self.security.allowed_roots.clone())
+        };
+
+        for path in &self.security.denied_paths {
+            policy.add_denied_path(path.clone());
+        }
+
+        for pattern in &self.security.denied_patterns {
+            policy.add_denied_pattern(pattern.clone());
+        }
+
+        policy.set_allow_writes(self.security.allow_writes);
+        policy.set_allow_deletes(self.security.allow_deletes);
+
+        policy
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    // Handle --init flag
+    if args.init {
+        let config_path = PathBuf::from("ufm.toml");
+        let config = Config::default();
+        config.save(&config_path)?;
+        println!(
+            "Created default configuration at: {}",
+            config_path.display()
+        );
+        println!("\nEdit this file to customize allowed directories and security settings.");
+        return Ok(());
+    }
+
+    // Load configuration
+    let config = if let Some(config_path) = &args.config {
+        Config::load(config_path)?
+    } else {
+        // Try default locations
+        let default_paths = vec![
+            PathBuf::from("ufm.toml"),
+            dirs::config_dir()
+                .map(|p| p.join("ufm").join("config.toml"))
+                .unwrap_or_default(),
+        ];
+
+        let mut loaded_config = None;
+        for path in default_paths {
+            if path.exists() {
+                match Config::load(&path) {
+                    Ok(c) => {
+                        loaded_config = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to load config from {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        loaded_config.unwrap_or_default()
+    };
+
+    // Initialize logging
+    let log_level = if args.verbose {
+        "debug"
+    } else {
+        &config.logging.level
+    };
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .init();
+
+    tracing::info!("Starting UFM v{}", full_version());
+
+    // Create the UFM server
+    let policy = config.to_security_policy();
+    let ufm_server = UfmServer::new(policy, config.name.clone(), config.version.clone());
+
+    tracing::info!("UFM ready, waiting for MCP client connection...");
+
+    // Run the MCP server
+    run_stdio_server(ufm_server).await?;
+
+    Ok(())
+}

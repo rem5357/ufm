@@ -1,0 +1,102 @@
+[package]
+name = "ufm"
+version = "0.1.0"
+edition = "2021"
+description = "Universal File Manager - Cross-platform MCP file management server"
+authors = ["Robert"]
+license = "MIT"
+repository = "https://github.com/mithroll/ufm"
+keywords = ["mcp", "file-manager", "cross-platform"]
+categories = ["filesystem", "command-line-utilities"]
+build = "build.rs"
+
+[dependencies]
+# Note: rust-mcp-sdk has rapid API changes. We implement MCP server directly.
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# File system operations
+walkdir = "2.5"                    # Recursive directory traversal
+fs_extra = "1.3"                   # Extended fs operations (copy with progress)
+filetime = "0.2"                   # Modify file timestamps
+same-file = "1.0"                  # Detect same file (for safe moves)
+
+# Archive support
+zip = "2.1"                        # ZIP archive read/write
+flate2 = "1.0"                     # gzip compression
+tar = "0.4"                        # tar archive support
+
+# Cross-platform metadata and attributes
+chrono = { version = "0.4", features = ["serde"] }
+
+# Path handling and globbing
+glob = "0.3"
+regex = "1.10"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Security - path sandboxing
+normpath = "1.2"                   # Normalize paths safely
+
+# Directory detection
+dirs = "5.0"
+
+# Config file parsing
+toml = "0.8"
+
+# Async trait support
+async-trait = "0.1"
+
+# Base64 encoding
+base64 = "0.22"
+
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Content detection
+infer = "0.16"                     # Detect file type by magic bytes
+encoding_rs = "0.8"                # Text encoding detection
+
+# Fast hashing (for crawler tools)
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+sha2 = "0.10"
+
+# Platform-specific features
+[target.'cfg(unix)'.dependencies]
+xattr = "1.3"                      # Extended attributes on Unix
+nix = { version = "0.29", features = ["fs", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_SystemServices",
+]}
+
+[features]
+default = ["archive-zip", "archive-tar"]
+archive-zip = []
+archive-tar = []
+remote = []                        # Future: enable remote file access
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[[bin]]
+name = "ufm"
+path = "src/main.rs"

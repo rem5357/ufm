@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build number tracking (we want this in version control)
+# BUILD
+
+# Config files (user-specific)
+ufm.toml
+*.local.toml
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

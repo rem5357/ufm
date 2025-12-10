@@ -1,0 +1,44 @@
+# UFM Configuration File
+# Copy this to ~/.config/ufm/config.toml or use with --config flag
+
+# Server identification (shown to MCP clients)
+name = "UFM"
+version = "0.1.0"
+
+[security]
+# Allowed root directories
+# Empty = defaults to user's home directory
+# Specify exact paths you want UFM to access
+allowed_roots = [
+    # Examples (uncomment and modify as needed):
+    # "/home/robert/Documents",
+    # "/home/robert/Projects",
+    # "C:\\Users\\Robert\\Documents",
+]
+
+# Explicitly denied paths (even within allowed roots)
+denied_paths = []
+
+# Glob patterns for files to never access
+# These are in ADDITION to built-in sensitive patterns
+denied_patterns = [
+    # Add your own patterns:
+    # "**/node_modules/*",
+    # "**/.git/*",
+]
+
+# Operation permissions
+allow_writes = true
+allow_deletes = true
+allow_chmod = true
+
+# Safety limits
+max_read_size = 104857600    # 100MB - prevents memory exhaustion
+max_recursion_depth = 50     # Maximum directory traversal depth
+
+[logging]
+# Log level: error, warn, info, debug, trace
+level = "info"
+
+# Uncomment to log to a file
+# file = "/var/log/ufm.log"
