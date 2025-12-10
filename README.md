@@ -21,7 +21,7 @@ Download the latest release for your platform from the releases page.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/ufm.git
+git clone https://github.com/rem5357/ufm.git
 cd ufm
 
 # Build for release

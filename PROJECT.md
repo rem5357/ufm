@@ -241,4 +241,4 @@ MIT License - See LICENSE file for details
 
 **Last Updated**: 2025-12-09
 **Maintainer**: Robert
-**Repository**: https://github.com/mithroll/ufm
+**Repository**: https://github.com/rem5357/ufm
