@@ -40,15 +40,25 @@ pub struct UfmServer {
     state: Arc<ToolState>,
     name: String,
     version: String,
+    build: String,
 }
 
 impl UfmServer {
-    pub fn new(policy: SecurityPolicy, name: String, version: String) -> Self {
+    pub fn new(policy: SecurityPolicy, name: String, version: String, build: String) -> Self {
         Self {
             state: Arc::new(ToolState::new(policy)),
             name,
             version,
+            build,
         }
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn build(&self) -> &str {
+        &self.build
     }
 }
 
@@ -95,6 +105,7 @@ Archive paths use :: notation: /path/to/archive.zip::internal/path"#
 
     async fn call_tool(&self, name: &str, args: Value) -> CallToolResult {
         let result = match name {
+            "ufm_status" => handle_status(&self.version, &self.build).await,
             "ufm_read" => handle_read_file(self.state.clone(), args).await,
             "ufm_stat" => handle_stat(self.state.clone(), args).await,
             "ufm_list" => handle_list(self.state.clone(), args).await,
@@ -130,6 +141,8 @@ Archive paths use :: notation: /path/to/archive.zip::internal/path"#
 /// Get all tool definitions
 pub fn get_tools() -> Vec<Tool> {
     vec![
+        // Status
+        status_tool(),
         // Read operations
         read_file_tool(),
         stat_tool(),
@@ -163,6 +176,18 @@ pub fn get_tools() -> Vec<Tool> {
 // ============================================================================
 // Tool Definitions
 // ============================================================================
+
+fn status_tool() -> Tool {
+    Tool::new(
+        "ufm_status",
+        "Get UFM server status including version, build number, and health check.",
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    )
+}
 
 fn read_file_tool() -> Tool {
     Tool::new(
@@ -644,7 +669,7 @@ fn archive_create_tool() -> Tool {
 fn crawl_tool() -> Tool {
     Tool::new(
         "ufm_crawl",
-        "Efficiently extract metadata from large directory trees in batches. Optimized for database ingestion and indexing.",
+        "Crawl directory tree returning file paths (relative to root), sizes, and modification times. Returns batched results with resume_token for continuation. Lightweight output to avoid context overflow.",
         json!({
             "type": "object",
             "properties": {
@@ -654,8 +679,8 @@ fn crawl_tool() -> Tool {
                 },
                 "batch_size": {
                     "type": "integer",
-                    "default": 1000,
-                    "description": "Number of entries per batch (100-10000)"
+                    "default": 500,
+                    "description": "Number of entries per batch (10-1000, default 500)"
                 },
                 "resume_token": {
                     "type": "string",
@@ -747,6 +772,19 @@ fn hash_sample_tool() -> Tool {
 // ============================================================================
 
 type ToolResult = Result<String, String>;
+
+async fn handle_status(version: &str, build: &str) -> ToolResult {
+    Ok(json!({
+        "status": "ok",
+        "name": "UFM",
+        "version": version,
+        "build": build,
+        "full_version": format!("{} (build {})", version, build),
+        "platform": std::env::consts::OS,
+        "arch": std::env::consts::ARCH
+    })
+    .to_string())
+}
 
 async fn handle_read_file(state: Arc<ToolState>, args: Value) -> ToolResult {
     let path: PathBuf = args["path"]
@@ -1227,19 +1265,51 @@ async fn handle_archive_create(state: Arc<ToolState>, args: Value) -> ToolResult
     .to_string())
 }
 
+/// Maximum response size in bytes to prevent MCP client timeouts
+const MAX_RESPONSE_SIZE: usize = 300_000; // 300KB - conservative for Claude Desktop
+
+/// Estimated bytes per entry for size calculation (reduced with minimal entry format)
+const ESTIMATED_BYTES_PER_ENTRY: usize = 100;
+
 async fn handle_crawl(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Defensive check for empty/null arguments
+    if args.is_null() || (args.is_object() && args.as_object().map(|o| o.is_empty()).unwrap_or(false)) {
+        tracing::warn!("ufm_crawl: received empty arguments");
+        return Err("ufm_crawl requires 'root' parameter".to_string());
+    }
+
     let root: PathBuf = args["root"]
         .as_str()
         .ok_or("root is required")?
         .into();
 
-    let batch_size = args["batch_size"].as_u64().unwrap_or(1000) as usize;
-    let batch_size = batch_size.clamp(100, 10000);
+    // Default to 500 - lightweight entries allow larger batches
+    let requested_batch_size = args["batch_size"].as_u64().unwrap_or(500) as usize;
+
+    // Calculate a safe batch size based on estimated response size
+    let safe_batch_size = MAX_RESPONSE_SIZE / ESTIMATED_BYTES_PER_ENTRY;
+    let batch_size = requested_batch_size.clamp(10, safe_batch_size.min(2000));
+
+    if batch_size != requested_batch_size {
+        tracing::debug!(
+            "ufm_crawl: adjusted batch_size from {} to {} for response safety",
+            requested_batch_size,
+            batch_size
+        );
+    }
 
     let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
     let dirs_only = args["dirs_only"].as_bool().unwrap_or(false);
     let max_depth = args["max_depth"].as_u64().map(|d| d as usize);
     let resume_token = args["resume_token"].as_str();
+
+    tracing::info!(
+        "ufm_crawl: root={}, batch_size={}, dirs_only={}, resume={}",
+        root.display(),
+        batch_size,
+        dirs_only,
+        resume_token.is_some()
+    );
 
     let skip_patterns: Vec<glob::Pattern> = args["skip_patterns"]
         .as_array()
@@ -1259,12 +1329,75 @@ async fn handle_crawl(state: Arc<ToolState>, args: Value) -> ToolResult {
         dirs_only,
     };
 
-    let result = state
-        .crawler
-        .crawl(&root, &options, resume_token)
-        .map_err(|e| e.to_string())?;
+    let crawl_start = std::time::Instant::now();
 
-    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+    // Run the crawl in a blocking task to avoid blocking the async runtime
+    // WalkDir is synchronous and can take a while on large directories
+    let crawler = state.crawler.clone();
+    let root_clone = root.clone();
+    let options_clone = options.clone();
+    let resume_token_owned = resume_token.map(|s| s.to_string());
+
+    let result = tokio::task::spawn_blocking(move || {
+        crawler.crawl(
+            &root_clone,
+            &options_clone,
+            resume_token_owned.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("Crawl task panicked: {}", e))?
+    .map_err(|e| {
+        tracing::error!("ufm_crawl error: {}", e);
+        e.to_string()
+    })?;
+
+    let crawl_duration = crawl_start.elapsed();
+    tracing::info!(
+        "ufm_crawl: found {} entries, {} dirs, complete={}, took {:?}",
+        result.entries.len(),
+        result.directories_seen.len(),
+        result.complete,
+        crawl_duration
+    );
+
+    // Use compact JSON (no pretty print) to reduce size
+    let json_result = serde_json::to_string(&result).map_err(|e| e.to_string())?;
+    let response_size = json_result.len();
+
+    tracing::debug!("ufm_crawl: response size = {} bytes", response_size);
+
+    // If still too large, return a summary with the resume token
+    if response_size > MAX_RESPONSE_SIZE {
+        tracing::warn!(
+            "ufm_crawl: response too large ({} bytes > {} max), returning summary",
+            response_size,
+            MAX_RESPONSE_SIZE
+        );
+
+        // Return a smaller response that still allows continuation
+        let summary = json!({
+            "warning": format!(
+                "Response would be {} bytes, exceeding {} limit. Reduce batch_size (was {}) or use dirs_only:true",
+                response_size,
+                MAX_RESPONSE_SIZE,
+                batch_size
+            ),
+            "entries_count": result.entries.len(),
+            "directories_count": result.directories_seen.len(),
+            "complete": result.complete,
+            "resume_token": result.resume_token,
+            "progress": result.progress,
+            "errors": result.errors,
+            // Include just the first few entries as a sample
+            "entries_sample": result.entries.iter().take(10).collect::<Vec<_>>(),
+            "recommended_batch_size": (batch_size / 2).max(10)
+        });
+
+        Ok(serde_json::to_string(&summary).map_err(|e| e.to_string())?)
+    } else {
+        Ok(json_result)
+    }
 }
 
 async fn handle_dir_check(state: Arc<ToolState>, args: Value) -> ToolResult {

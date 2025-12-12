@@ -1,0 +1,19 @@
+# UFM Debug Configuration
+# Use with: ufm --config ufm.debug.toml
+
+name = "UFM"
+version = "0.11.0"
+
+[security]
+allowed_roots = []  # Empty = user's home directory
+denied_paths = []
+denied_patterns = []
+allow_writes = true
+allow_deletes = true
+allow_chmod = true
+max_read_size = 104857600
+max_recursion_depth = 50
+
+[logging]
+level = "debug"
+file = "/tmp/ufm.log"

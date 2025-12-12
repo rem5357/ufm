@@ -40,24 +40,33 @@ pub enum CrawlError {
 
 pub type Result<T> = std::result::Result<T, CrawlError>;
 
-/// A single file entry from the crawl
+/// A single file entry from the crawl - full metadata for Rust-to-Rust communication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlEntry {
     pub path: PathBuf,
-    pub parent: PathBuf,
     pub name: String,
-    pub stem: String,
     pub extension: Option<String>,
     pub size: u64,
-    pub modified: i64,      // Unix timestamp
+    pub modified: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created: Option<i64>,
     pub is_dir: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_hidden: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_symlink: bool,
-    #[cfg(unix)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
-    #[cfg(not(unix))]
-    pub mode: Option<u32>,
+}
+
+/// Minimal entry format for Claude Desktop / low-bandwidth scenarios
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrawlEntryMinimal {
+    pub path: PathBuf,
+    pub size: u64,
+    pub modified: i64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_dir: bool,
 }
 
 /// Directory metadata for change detection
@@ -87,11 +96,22 @@ pub struct CrawlErrorEntry {
 /// Result of a crawl operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlResult {
+    /// Root path - entries have paths relative to this
+    pub root: PathBuf,
+    /// File/directory entries (paths are relative to root)
     pub entries: Vec<CrawlEntry>,
-    pub directories_seen: Vec<DirMeta>,
+    /// Token to continue crawl if not complete
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_token: Option<String>,
+    /// Progress statistics
     pub progress: CrawlProgress,
+    /// True if crawl is complete
     pub complete: bool,
+    /// Directory metadata (only included if useful for change detection)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub directories_seen: Vec<DirMeta>,
+    /// Errors encountered (non-fatal)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<CrawlErrorEntry>,
 }
 
@@ -118,11 +138,20 @@ impl Default for CrawlOptions {
 }
 
 /// Resume token data (serialized to base64)
+///
+/// Uses path-based resumption for robustness: we track the last processed path
+/// and skip entries until we find it, then continue from there. This is more
+/// reliable than position-based tracking since filesystem order can change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ResumeToken {
-    current_path: PathBuf,
-    position: u64,
+    /// The last path that was fully processed
+    last_path: PathBuf,
+    /// Root directory (to validate token matches current crawl)
+    root: PathBuf,
+    /// Hash of skip patterns (to detect config changes)
     pattern_hash: u64,
+    /// Version marker for future compatibility
+    version: u8,
 }
 
 /// Result of directory check
@@ -134,7 +163,7 @@ pub struct DirCheckResult {
     pub current_children: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DirStatus {
     Unchanged,
@@ -181,6 +210,7 @@ pub enum HashType {
 }
 
 /// Crawler manager
+#[derive(Clone)]
 pub struct Crawler {
     policy: SecurityPolicy,
 }
@@ -191,6 +221,10 @@ impl Crawler {
     }
 
     /// Crawl a directory tree, returning batched results
+    ///
+    /// Uses path-based resumption for robustness. When a resume_token is provided,
+    /// the crawler will skip entries until it finds the last processed path, then
+    /// continue from there.
     pub fn crawl(
         &self,
         root: &Path,
@@ -204,12 +238,33 @@ impl Crawler {
         }
 
         // Parse resume token if provided
-        let resume_pos = if let Some(token) = resume_token {
+        let resume_after_path = if let Some(token) = resume_token {
             let decoded = STANDARD.decode(token)
                 .map_err(|_| CrawlError::InvalidResumeToken)?;
-            let token: ResumeToken = serde_json::from_slice(&decoded)
+            let parsed: ResumeToken = serde_json::from_slice(&decoded)
                 .map_err(|_| CrawlError::InvalidResumeToken)?;
-            Some(token.position)
+
+            // Validate the token is for the same root
+            if parsed.root != safe_root {
+                tracing::warn!(
+                    "Resume token root mismatch: expected {:?}, got {:?}",
+                    safe_root,
+                    parsed.root
+                );
+                return Err(CrawlError::InvalidResumeToken);
+            }
+
+            // Check pattern hash matches
+            let current_hash = hash_patterns(&options.skip_patterns);
+            if parsed.pattern_hash != current_hash {
+                tracing::warn!(
+                    "Resume token pattern hash mismatch: crawl options changed"
+                );
+                return Err(CrawlError::InvalidResumeToken);
+            }
+
+            tracing::debug!("Resuming crawl after path: {:?}", parsed.last_path);
+            Some(parsed.last_path)
         } else {
             None
         };
@@ -217,10 +272,12 @@ impl Crawler {
         let max_depth = options.max_depth
             .unwrap_or(self.policy.max_recursion_depth() as usize);
 
+        // Use sort_by_file_name for consistent ordering across runs
         let walker = WalkDir::new(&safe_root)
             .max_depth(max_depth)
             .follow_links(false)
-            .contents_first(false);
+            .contents_first(false)
+            .sort_by_file_name();
 
         let mut entries = Vec::with_capacity(options.batch_size);
         let mut directories_seen = Vec::new();
@@ -232,19 +289,12 @@ impl Crawler {
             errors: 0,
         };
 
-        let mut position: u64 = 0;
-        let start_pos = resume_pos.unwrap_or(0);
         let mut complete = true;
         let mut last_path = PathBuf::new();
+        let mut found_resume_point = resume_after_path.is_none();
+        let mut skipped_count: u64 = 0;
 
         for entry_result in walker {
-            position += 1;
-
-            // Skip until we reach resume position
-            if position <= start_pos {
-                continue;
-            }
-
             let entry = match entry_result {
                 Ok(e) => e,
                 Err(e) => {
@@ -262,6 +312,23 @@ impl Crawler {
             // Skip root itself
             if path == safe_root {
                 continue;
+            }
+
+            // If we're resuming, skip until we find the resume point
+            if !found_resume_point {
+                if let Some(ref resume_path) = resume_after_path {
+                    if path == resume_path.as_path() {
+                        found_resume_point = true;
+                        tracing::debug!(
+                            "Found resume point at {:?}, skipped {} entries",
+                            path,
+                            skipped_count
+                        );
+                    } else {
+                        skipped_count += 1;
+                    }
+                    continue;
+                }
             }
 
             // Check skip patterns
@@ -308,7 +375,7 @@ impl Crawler {
 
                 if options.dirs_only {
                     // Add directory as an entry too
-                    if let Some(crawl_entry) = self.create_entry(&entry, &metadata) {
+                    if let Some(crawl_entry) = self.create_entry(&entry, &metadata, &safe_root) {
                         entries.push(crawl_entry);
                     }
                 }
@@ -317,7 +384,7 @@ impl Crawler {
                 progress.bytes_total += metadata.len();
 
                 if !options.dirs_only {
-                    if let Some(crawl_entry) = self.create_entry(&entry, &metadata) {
+                    if let Some(crawl_entry) = self.create_entry(&entry, &metadata, &safe_root) {
                         entries.push(crawl_entry);
                     }
                 }
@@ -332,12 +399,22 @@ impl Crawler {
             }
         }
 
+        // If we never found the resume point, the token is stale
+        if !found_resume_point && resume_after_path.is_some() {
+            tracing::warn!(
+                "Resume point not found - file may have been deleted. Starting from beginning would be needed."
+            );
+            // Don't error - just report as complete with what we have
+            // The caller can decide to start fresh
+        }
+
         // Generate resume token if not complete
-        let resume_token = if !complete {
+        let resume_token = if !complete && !last_path.as_os_str().is_empty() {
             let token = ResumeToken {
-                current_path: last_path,
-                position,
+                last_path: last_path.clone(),
+                root: safe_root.clone(),
                 pattern_hash: hash_patterns(&options.skip_patterns),
+                version: 1,
             };
             let json = serde_json::to_vec(&token).unwrap_or_default();
             Some(STANDARD.encode(&json))
@@ -345,12 +422,20 @@ impl Crawler {
             None
         };
 
+        tracing::debug!(
+            "Crawl batch complete: {} entries, {} dirs, complete={}",
+            entries.len(),
+            directories_seen.len(),
+            complete
+        );
+
         Ok(CrawlResult {
+            root: safe_root,
             entries,
-            directories_seen,
             resume_token,
             progress,
             complete,
+            directories_seen,
             errors,
         })
     }
@@ -630,14 +715,14 @@ impl Crawler {
         }
     }
 
-    fn create_entry(&self, entry: &WalkDirEntry, metadata: &fs::Metadata) -> Option<CrawlEntry> {
+    fn create_entry(&self, entry: &WalkDirEntry, metadata: &fs::Metadata, root: &Path) -> Option<CrawlEntry> {
         let path = entry.path();
-        let parent = path.parent()?.to_path_buf();
         let name = entry.file_name().to_string_lossy().to_string();
 
-        let stem = path.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| name.clone());
+        // Use relative path from root
+        let rel_path = path.strip_prefix(root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| path.to_path_buf());
 
         let extension = path.extension()
             .map(|e| e.to_string_lossy().to_string());
@@ -663,10 +748,8 @@ impl Crawler {
         let mode = None;
 
         Some(CrawlEntry {
-            path: path.to_path_buf(),
-            parent,
+            path: rel_path,
             name,
-            stem,
             extension,
             size: metadata.len(),
             modified,
@@ -675,6 +758,27 @@ impl Crawler {
             is_hidden: is_hidden(path),
             is_symlink: metadata.is_symlink(),
             mode,
+        })
+    }
+
+    fn create_entry_minimal(&self, entry: &WalkDirEntry, metadata: &fs::Metadata, root: &Path) -> Option<CrawlEntryMinimal> {
+        let path = entry.path();
+
+        let rel_path = path.strip_prefix(root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| path.to_path_buf());
+
+        let modified = metadata.modified()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0))
+            .unwrap_or(0);
+
+        Some(CrawlEntryMinimal {
+            path: rel_path,
+            size: metadata.len(),
+            modified,
+            is_dir: metadata.is_dir(),
         })
     }
 

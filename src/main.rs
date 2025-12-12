@@ -74,7 +74,7 @@ struct Config {
     logging: LoggingConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SecurityConfig {
     /// Allowed root directories (empty = user's home directory)
     #[serde(default)]
@@ -125,6 +125,21 @@ impl Default for LoggingConfig {
         Self {
             level: "info".to_string(),
             file: None,
+        }
+    }
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            allowed_roots: Vec::new(),
+            denied_paths: Vec::new(),
+            denied_patterns: Vec::new(),
+            allow_writes: true,
+            allow_deletes: true,
+            allow_chmod: true,
+            max_read_size: default_max_read_size(),
+            max_recursion_depth: default_max_depth(),
         }
     }
 }
@@ -255,19 +270,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.logging.level
     };
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-        )
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
+
+    // If a log file is configured, write to both stderr and file
+    if let Some(ref log_path) = config.logging.file {
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+
+        // Create log directory if needed
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Open log file in append mode
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .expect("Failed to open log file");
+
+        let file_writer = std::sync::Mutex::new(file);
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr.and(file_writer))
+                    .with_ansi(false) // Disable colors for file output
+            )
+            .init();
+
+        eprintln!("Logging to: {}", log_path.display());
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+    }
 
     tracing::info!("Starting UFM v{}", full_version());
 
     // Create the UFM server
     let policy = config.to_security_policy();
-    let ufm_server = UfmServer::new(policy, config.name.clone(), config.version.clone());
+    let ufm_server = UfmServer::new(
+        policy,
+        config.name.clone(),
+        config.version.clone(),
+        BUILD_NUMBER.to_string(),
+    );
 
     tracing::info!("UFM ready, waiting for MCP client connection...");
 

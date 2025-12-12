@@ -4,7 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// JSON-RPC 2.0 Request
 #[derive(Debug, Clone, Deserialize)]
@@ -161,22 +162,63 @@ pub trait McpServerHandler: Send + Sync {
     async fn call_tool(&self, name: &str, arguments: Value) -> CallToolResult;
 }
 
-/// Run the MCP server on stdio
+/// Run the MCP server on stdio using async I/O
 pub async fn run_stdio_server<H: McpServerHandler + 'static>(handler: H) -> io::Result<()> {
-    let stdin = io::stdin();
+    let stdin = tokio::io::stdin();
     let stdout = io::stdout();
+    let mut reader = BufReader::new(stdin);
 
     let handler = std::sync::Arc::new(handler);
+    let mut request_count: u64 = 0;
+    let mut line = String::new();
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    tracing::debug!("MCP server starting async stdio loop");
+
+    loop {
+        line.clear();
+
+        // Read line asynchronously with a timeout to prevent indefinite blocking
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_secs(300), // 5 minute timeout
+            reader.read_line(&mut line)
+        ).await;
+
+        let bytes_read = match read_result {
+            Ok(Ok(0)) => {
+                // EOF reached
+                tracing::info!("MCP server stdin closed (EOF), shutting down");
+                break;
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                tracing::error!("MCP stdin read error: {}", e);
+                return Err(e);
+            }
+            Err(_) => {
+                // Timeout - this is actually fine, just continue waiting
+                tracing::debug!("MCP server: read timeout, continuing...");
+                continue;
+            }
+        };
+
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
+        request_count += 1;
+        let request_start = std::time::Instant::now();
+
+        tracing::debug!(
+            "MCP request #{}: received {} bytes",
+            request_count,
+            bytes_read
+        );
+
+        let request: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
+                tracing::error!("MCP parse error: {} (input: {})", e, &line[..line.len().min(100)]);
                 let response = JsonRpcResponse::error(
                     Value::Null,
                     -32700,
@@ -192,8 +234,16 @@ pub async fn run_stdio_server<H: McpServerHandler + 'static>(handler: H) -> io::
 
         // Handle notifications (no id) - just ignore for now
         if request.id.is_none() {
+            tracing::debug!("MCP notification (no id): {}", request.method);
             continue;
         }
+
+        tracing::info!(
+            "MCP request #{}: method={}, id={:?}",
+            request_count,
+            request.method,
+            id
+        );
 
         let response = match request.method.as_str() {
             "initialize" => {
@@ -216,15 +266,53 @@ pub async fn run_stdio_server<H: McpServerHandler + 'static>(handler: H) -> io::
                 let name = params["name"].as_str().unwrap_or("");
                 let arguments = params["arguments"].clone();
 
-                let result = handler.call_tool(name, arguments).await;
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap_or(json!({})))
+                tracing::debug!("MCP tools/call: tool={}", name);
+
+                // Run the tool call with a timeout to prevent hanging
+                let tool_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(60), // 60 second timeout for tool calls
+                    handler.call_tool(name, arguments)
+                ).await;
+
+                match tool_result {
+                    Ok(result) => JsonRpcResponse::success(id, serde_json::to_value(result).unwrap_or(json!({}))),
+                    Err(_) => {
+                        tracing::error!("MCP tools/call timeout: tool={}", name);
+                        JsonRpcResponse::success(
+                            id,
+                            serde_json::to_value(CallToolResult::error(
+                                format!("Tool '{}' timed out after 60 seconds", name)
+                            )).unwrap_or(json!({}))
+                        )
+                    }
+                }
             }
             "ping" => JsonRpcResponse::success(id, json!({})),
-            _ => JsonRpcResponse::error(id, -32601, &format!("Method not found: {}", request.method)),
+            _ => {
+                tracing::warn!("MCP unknown method: {}", request.method);
+                JsonRpcResponse::error(id, -32601, &format!("Method not found: {}", request.method))
+            }
         };
 
-        writeln!(stdout.lock(), "{}", serde_json::to_string(&response)?)?;
-        stdout.lock().flush()?;
+        let response_json = serde_json::to_string(&response)?;
+        let response_size = response_json.len();
+        let duration = request_start.elapsed();
+
+        tracing::info!(
+            "MCP request #{}: completed in {:?}, response {} bytes",
+            request_count,
+            duration,
+            response_size
+        );
+
+        // Write response - use a lock scope to ensure quick release
+        {
+            let mut stdout_lock = stdout.lock();
+            writeln!(stdout_lock, "{}", response_json)?;
+            stdout_lock.flush()?;
+        }
+
+        tracing::debug!("MCP request #{}: response sent and flushed", request_count);
     }
 
     Ok(())
