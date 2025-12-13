@@ -177,8 +177,9 @@ if (-not $SkipClaudeConfig) {
             }
             $Config.mcpServers | Add-Member -NotePropertyName "ufm" -NotePropertyValue $UfmConfig -Force
 
-            # Write updated config
-            $Config | ConvertTo-Json -Depth 10 | Set-Content $ClaudeConfigPath -Encoding UTF8
+            # Write updated config (use ASCII to avoid BOM that breaks Claude Desktop)
+            $JsonOutput = $Config | ConvertTo-Json -Depth 10
+            [System.IO.File]::WriteAllText($ClaudeConfigPath, $JsonOutput)
             Write-Success "Updated Claude Desktop config"
         }
     } else {
@@ -208,7 +209,8 @@ if (-not $SkipClaudeConfig) {
             }
         }
 
-        $NewConfig | ConvertTo-Json -Depth 10 | Set-Content $ClaudeConfigPath -Encoding UTF8
+        $JsonOutput = $NewConfig | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($ClaudeConfigPath, $JsonOutput)
         Write-Success "Created Claude Desktop config"
     }
 }
