@@ -1,0 +1,18 @@
+[Unit]
+Description=UFM - Universal File Manager (P2P Daemon)
+After=network.target
+
+[Service]
+Type=simple
+User=mithroll
+ExecStart=/usr/local/bin/ufm --network --daemon --node-name goldshire
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ufm
+
+[Install]
+WantedBy=multi-user.target

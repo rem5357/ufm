@@ -26,3 +26,12 @@ ufm.toml
 # Temporary files
 *.tmp
 *.temp
+
+# Release binaries (download from release server)
+dist/release/*.exe
+dist/release/ufm-linux-*
+dist/release/version.json
+
+# SSE bridge server (deprecated)
+ufm-sse-server.js
+ufm-server

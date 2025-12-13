@@ -14,6 +14,7 @@ use crate::crawler::{CrawlOptions, Crawler, DirCheckInput, HashAlgorithm, HashTy
 use crate::mcp::{
     CallToolResult, McpServerHandler, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
 };
+use crate::network::{NetworkService, NodeRef, PeerStatus};
 use crate::operations::{CopyOptions, FileManager, ListOptions, ReadOptions, SortBy, WriteOptions};
 use crate::platform::FileAttributes;
 use crate::security::SecurityPolicy;
@@ -23,6 +24,8 @@ pub struct ToolState {
     pub file_manager: FileManager,
     pub archive_manager: RwLock<ArchiveManager>,
     pub crawler: Crawler,
+    /// Optional network service for P2P functionality
+    pub network: Option<Arc<NetworkService>>,
 }
 
 impl ToolState {
@@ -31,13 +34,24 @@ impl ToolState {
             file_manager: FileManager::new(policy.clone()),
             archive_manager: RwLock::new(ArchiveManager::new()),
             crawler: Crawler::new(policy),
+            network: None,
+        }
+    }
+
+    /// Create a new ToolState with network service
+    pub fn with_network(policy: SecurityPolicy, network: Arc<NetworkService>) -> Self {
+        Self {
+            file_manager: FileManager::new(policy.clone()),
+            archive_manager: RwLock::new(ArchiveManager::new()),
+            crawler: Crawler::new(policy),
+            network: Some(network),
         }
     }
 }
 
 /// UFM MCP Server implementation
 pub struct UfmServer {
-    state: Arc<ToolState>,
+    pub state: Arc<ToolState>,
     name: String,
     version: String,
     build: String,
@@ -47,6 +61,22 @@ impl UfmServer {
     pub fn new(policy: SecurityPolicy, name: String, version: String, build: String) -> Self {
         Self {
             state: Arc::new(ToolState::new(policy)),
+            name,
+            version,
+            build,
+        }
+    }
+
+    /// Create a new UfmServer with P2P networking enabled
+    pub fn with_network(
+        policy: SecurityPolicy,
+        name: String,
+        version: String,
+        build: String,
+        network: Arc<NetworkService>,
+    ) -> Self {
+        Self {
+            state: Arc::new(ToolState::with_network(policy, network)),
             name,
             version,
             build,
@@ -105,7 +135,7 @@ Archive paths use :: notation: /path/to/archive.zip::internal/path"#
 
     async fn call_tool(&self, name: &str, args: Value) -> CallToolResult {
         let result = match name {
-            "ufm_status" => handle_status(&self.version, &self.build).await,
+            "ufm_status" => handle_status(self.state.clone(), args, &self.version, &self.build).await,
             "ufm_read" => handle_read_file(self.state.clone(), args).await,
             "ufm_stat" => handle_stat(self.state.clone(), args).await,
             "ufm_list" => handle_list(self.state.clone(), args).await,
@@ -128,6 +158,12 @@ Archive paths use :: notation: /path/to/archive.zip::internal/path"#
             "ufm_crawl" => handle_crawl(self.state.clone(), args).await,
             "ufm_dir_check" => handle_dir_check(self.state.clone(), args).await,
             "ufm_hash_sample" => handle_hash_sample(self.state.clone(), args).await,
+            // P2P Network tools
+            "ufm_nodes" => handle_nodes(self.state.clone(), args).await,
+            "ufm_ping" => handle_ping(self.state.clone(), args).await,
+            "ufm_discover" => handle_discover(self.state.clone(), args).await,
+            "ufm_transfer" => handle_transfer(self.state.clone(), args).await,
+            "ufm_transfer_status" => handle_transfer_status(self.state.clone(), args).await,
             _ => Err(format!("Unknown tool: {}", name)),
         };
 
@@ -170,6 +206,12 @@ pub fn get_tools() -> Vec<Tool> {
         crawl_tool(),
         dir_check_tool(),
         hash_sample_tool(),
+        // P2P Network operations
+        nodes_tool(),
+        ping_tool(),
+        discover_tool(),
+        transfer_tool(),
+        transfer_status_tool(),
     ]
 }
 
@@ -177,13 +219,26 @@ pub fn get_tools() -> Vec<Tool> {
 // Tool Definitions
 // ============================================================================
 
+/// Helper to create the node parameter schema for remote execution
+fn node_param_schema() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {"type": "integer", "description": "Node ID (0 = local)"},
+            {"type": "string", "description": "Node name or UUID"}
+        ],
+        "description": "Target node for remote execution. Omit or use 0/'local' for local execution."
+    })
+}
+
 fn status_tool() -> Tool {
     Tool::new(
         "ufm_status",
-        "Get UFM server status including version, build number, and health check.",
+        "Get UFM server status including version, build number, and health check. Can target a specific node.",
         json!({
             "type": "object",
-            "properties": {},
+            "properties": {
+                "node": node_param_schema()
+            },
             "required": []
         }),
     )
@@ -192,7 +247,7 @@ fn status_tool() -> Tool {
 fn read_file_tool() -> Tool {
     Tool::new(
         "ufm_read",
-        "Read the contents of a file. Returns text content by default, or base64 for binary files.",
+        "Read the contents of a file. Returns text content by default, or base64 for binary files. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -200,6 +255,7 @@ fn read_file_tool() -> Tool {
                     "type": "string",
                     "description": "Path to the file to read"
                 },
+                "node": node_param_schema(),
                 "encoding": {
                     "type": "string",
                     "description": "Text encoding (utf-8, utf-16, etc.). Auto-detected if not specified."
@@ -225,14 +281,15 @@ fn read_file_tool() -> Tool {
 fn stat_tool() -> Tool {
     Tool::new(
         "ufm_stat",
-        "Get detailed metadata about a file or directory including size, dates, permissions, and MIME type.",
+        "Get detailed metadata about a file or directory including size, dates, permissions, and MIME type. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                     "description": "Path to get metadata for"
-                }
+                },
+                "node": node_param_schema()
             },
             "required": ["path"]
         }),
@@ -242,7 +299,7 @@ fn stat_tool() -> Tool {
 fn list_tool() -> Tool {
     Tool::new(
         "ufm_list",
-        "List contents of a directory with optional filtering and sorting.",
+        "List contents of a directory with optional filtering and sorting. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -250,6 +307,7 @@ fn list_tool() -> Tool {
                     "type": "string",
                     "description": "Directory path to list"
                 },
+                "node": node_param_schema(),
                 "recursive": {
                     "type": "boolean",
                     "description": "List recursively"
@@ -284,14 +342,15 @@ fn list_tool() -> Tool {
 fn exists_tool() -> Tool {
     Tool::new(
         "ufm_exists",
-        "Check if a path exists.",
+        "Check if a path exists. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                     "description": "Path to check"
-                }
+                },
+                "node": node_param_schema()
             },
             "required": ["path"]
         }),
@@ -301,7 +360,7 @@ fn exists_tool() -> Tool {
 fn search_tool() -> Tool {
     Tool::new(
         "ufm_search",
-        "Search for files matching a glob pattern recursively.",
+        "Search for files matching a glob pattern recursively. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -309,6 +368,7 @@ fn search_tool() -> Tool {
                     "type": "string",
                     "description": "Root directory to search from"
                 },
+                "node": node_param_schema(),
                 "pattern": {
                     "type": "string",
                     "description": "Glob pattern to match (e.g., '*.log', 'test_*')"
@@ -330,7 +390,7 @@ fn search_tool() -> Tool {
 fn write_file_tool() -> Tool {
     Tool::new(
         "ufm_write",
-        "Write content to a file. Creates the file and parent directories if they don't exist.",
+        "Write content to a file. Creates the file and parent directories if they don't exist. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -338,6 +398,7 @@ fn write_file_tool() -> Tool {
                     "type": "string",
                     "description": "Path to write to"
                 },
+                "node": node_param_schema(),
                 "content": {
                     "type": "string",
                     "description": "Content to write"
@@ -359,7 +420,7 @@ fn write_file_tool() -> Tool {
 fn mkdir_tool() -> Tool {
     Tool::new(
         "ufm_mkdir",
-        "Create a directory.",
+        "Create a directory. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -367,6 +428,7 @@ fn mkdir_tool() -> Tool {
                     "type": "string",
                     "description": "Directory path to create"
                 },
+                "node": node_param_schema(),
                 "recursive": {
                     "type": "boolean",
                     "description": "Create parent directories as needed (default true)"
@@ -380,7 +442,7 @@ fn mkdir_tool() -> Tool {
 fn delete_tool() -> Tool {
     Tool::new(
         "ufm_delete",
-        "Delete a file or directory.",
+        "Delete a file or directory. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -388,6 +450,7 @@ fn delete_tool() -> Tool {
                     "type": "string",
                     "description": "Path to delete"
                 },
+                "node": node_param_schema(),
                 "recursive": {
                     "type": "boolean",
                     "description": "Delete directories recursively (required for non-empty dirs)"
@@ -401,7 +464,7 @@ fn delete_tool() -> Tool {
 fn rename_tool() -> Tool {
     Tool::new(
         "ufm_rename",
-        "Move or rename a file or directory.",
+        "Move or rename a file or directory. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -412,7 +475,8 @@ fn rename_tool() -> Tool {
                 "to": {
                     "type": "string",
                     "description": "Destination path"
-                }
+                },
+                "node": node_param_schema()
             },
             "required": ["from", "to"]
         }),
@@ -422,7 +486,7 @@ fn rename_tool() -> Tool {
 fn copy_tool() -> Tool {
     Tool::new(
         "ufm_copy",
-        "Copy a file or directory.",
+        "Copy a file or directory. Supports cross-node transfers with source_node and dest_node.",
         json!({
             "type": "object",
             "properties": {
@@ -434,6 +498,8 @@ fn copy_tool() -> Tool {
                     "type": "string",
                     "description": "Destination path"
                 },
+                "source_node": node_param_schema(),
+                "dest_node": node_param_schema(),
                 "overwrite": {
                     "type": "boolean",
                     "description": "Overwrite if destination exists"
@@ -669,7 +735,7 @@ fn archive_create_tool() -> Tool {
 fn crawl_tool() -> Tool {
     Tool::new(
         "ufm_crawl",
-        "Crawl directory tree returning file paths (relative to root), sizes, and modification times. Returns batched results with resume_token for continuation. Lightweight output to avoid context overflow.",
+        "Crawl directory tree returning file paths (relative to root), sizes, and modification times. Returns batched results with resume_token for continuation. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -677,6 +743,7 @@ fn crawl_tool() -> Tool {
                     "type": "string",
                     "description": "Root directory to crawl"
                 },
+                "node": node_param_schema(),
                 "batch_size": {
                     "type": "integer",
                     "default": 500,
@@ -714,7 +781,7 @@ fn crawl_tool() -> Tool {
 fn dir_check_tool() -> Tool {
     Tool::new(
         "ufm_dir_check",
-        "Quickly check if directories have changed since last crawl without reading all files.",
+        "Quickly check if directories have changed since last crawl without reading all files. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -730,7 +797,8 @@ fn dir_check_tool() -> Tool {
                         "required": ["path", "expected_mtime"]
                     },
                     "description": "Directories to check with their expected state"
-                }
+                },
+                "node": node_param_schema()
             },
             "required": ["directories"]
         }),
@@ -740,7 +808,7 @@ fn dir_check_tool() -> Tool {
 fn hash_sample_tool() -> Tool {
     Tool::new(
         "ufm_hash_sample",
-        "Generate fast fingerprint hashes for duplicate detection without reading entire files.",
+        "Generate fast fingerprint hashes for duplicate detection without reading entire files. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -749,6 +817,7 @@ fn hash_sample_tool() -> Tool {
                     "items": { "type": "string" },
                     "description": "Files to hash (max 100 per call)"
                 },
+                "node": node_param_schema(),
                 "algorithm": {
                     "type": "string",
                     "enum": ["sample", "full"],
@@ -768,12 +837,217 @@ fn hash_sample_tool() -> Tool {
 }
 
 // ============================================================================
+// P2P Network Tool Definitions
+// ============================================================================
+
+fn nodes_tool() -> Tool {
+    Tool::new(
+        "ufm_nodes",
+        "List all known UFM nodes on the P2P network, including connection status and latency.",
+        json!({
+            "type": "object",
+            "properties": {
+                "include_offline": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Include disconnected/unreachable nodes"
+                }
+            }
+        }),
+    )
+}
+
+fn ping_tool() -> Tool {
+    Tool::new(
+        "ufm_ping",
+        "Check connectivity and measure latency to a specific UFM node.",
+        json!({
+            "type": "object",
+            "properties": {
+                "node": {
+                    "oneOf": [
+                        {"type": "integer"},
+                        {"type": "string"}
+                    ],
+                    "description": "Node ID, name, or UUID to ping"
+                },
+                "count": {
+                    "type": "integer",
+                    "default": 3,
+                    "description": "Number of pings to send"
+                }
+            },
+            "required": ["node"]
+        }),
+    )
+}
+
+fn discover_tool() -> Tool {
+    Tool::new(
+        "ufm_discover",
+        "Trigger immediate network discovery to find new UFM peers.",
+        json!({
+            "type": "object",
+            "properties": {
+                "timeout_secs": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Discovery timeout in seconds"
+                }
+            }
+        }),
+    )
+}
+
+fn transfer_tool() -> Tool {
+    Tool::new(
+        "ufm_transfer",
+        "Transfer a file between nodes using streaming. Returns a transfer ID for tracking progress.",
+        json!({
+            "type": "object",
+            "properties": {
+                "source_path": {
+                    "type": "string",
+                    "description": "Path to the source file"
+                },
+                "source_node": node_param_schema(),
+                "dest_path": {
+                    "type": "string",
+                    "description": "Path to write the file on the destination"
+                },
+                "dest_node": node_param_schema(),
+                "compression": {
+                    "type": "string",
+                    "enum": ["none", "gzip", "zstd"],
+                    "default": "zstd",
+                    "description": "Compression method for transfer"
+                }
+            },
+            "required": ["source_path", "dest_path"]
+        }),
+    )
+}
+
+fn transfer_status_tool() -> Tool {
+    Tool::new(
+        "ufm_transfer_status",
+        "Get status of a file transfer by ID, or list all active transfers.",
+        json!({
+            "type": "object",
+            "properties": {
+                "transfer_id": {
+                    "type": "integer",
+                    "description": "Specific transfer ID to check (omit to list all)"
+                }
+            }
+        }),
+    )
+}
+
+// ============================================================================
 // Tool Handlers
 // ============================================================================
 
 type ToolResult = Result<String, String>;
 
-async fn handle_status(version: &str, build: &str) -> ToolResult {
+/// Extract NodeRef from args and check if it's local or needs remote routing
+fn extract_node_ref(args: &Value) -> NodeRef {
+    let node = &args["node"];
+    if node.is_null() {
+        return NodeRef::Local;
+    }
+
+    if let Some(id) = node.as_u64() {
+        if id == 0 {
+            return NodeRef::Local;
+        }
+        return NodeRef::Id(id as u32);
+    }
+
+    if let Some(s) = node.as_str() {
+        if s.is_empty() || s == "local" || s == "0" {
+            return NodeRef::Local;
+        }
+        // Try parsing as UUID
+        if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+            return NodeRef::Uuid(uuid);
+        }
+        return NodeRef::Name(s.to_string());
+    }
+
+    NodeRef::Local
+}
+
+/// Check if a tool request should be routed remotely
+/// Returns Ok(None) if local, Ok(Some(result)) if handled remotely, Err if error
+async fn maybe_route_remote(
+    state: &Arc<ToolState>,
+    args: &Value,
+    tool_name: &str,
+) -> Result<Option<String>, String> {
+    let node_ref = extract_node_ref(args);
+
+    // Check if local
+    if matches!(node_ref, NodeRef::Local) {
+        return Ok(None); // Handle locally
+    }
+
+    // Need network service for remote calls
+    let network = state.network.as_ref()
+        .ok_or("P2P networking not enabled - run with --network flag")?;
+
+    // Check if this node reference is actually local
+    if network.peers.is_local(&node_ref).await {
+        return Ok(None); // Handle locally
+    }
+
+    // Route to remote peer
+    let result = network.router.route_tool_request(&node_ref, tool_name, args.clone()).await
+        .map_err(|e| format!("Remote call failed: {}", e))?;
+
+    match result {
+        Some(tool_result) => {
+            match tool_result {
+                crate::network::protocol::ToolResult::Success(data) => {
+                    Ok(Some(data.to_string()))
+                }
+                crate::network::protocol::ToolResult::Error(e) => {
+                    Err(e)
+                }
+            }
+        }
+        None => Ok(None), // Should handle locally (shouldn't happen)
+    }
+}
+
+async fn handle_status(state: Arc<ToolState>, args: Value, version: &str, build: &str) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_status").await? {
+        return Ok(result);
+    }
+
+    // Get network interface information
+    let network_info = get_network_info();
+
+    // Include P2P network status if enabled
+    let p2p_status = if let Some(ref network) = state.network {
+        let nodes = network.peers.list_nodes().await;
+        let connected = nodes.iter()
+            .filter(|n| matches!(n.status, PeerStatus::Connected))
+            .count();
+        json!({
+            "enabled": network.enabled,
+            "node_name": network.identity.name,
+            "node_uuid": network.identity.uuid.to_string(),
+            "peers_discovered": nodes.len() - 1, // Exclude self
+            "peers_connected": connected.saturating_sub(1) // Exclude self
+        })
+    } else {
+        json!({
+            "enabled": false
+        })
+    };
+
     Ok(json!({
         "status": "ok",
         "name": "UFM",
@@ -781,12 +1055,141 @@ async fn handle_status(version: &str, build: &str) -> ToolResult {
         "build": build,
         "full_version": format!("{} (build {})", version, build),
         "platform": std::env::consts::OS,
-        "arch": std::env::consts::ARCH
+        "arch": std::env::consts::ARCH,
+        "hostname": get_hostname(),
+        "network": network_info,
+        "p2p": p2p_status
     })
     .to_string())
 }
 
+/// Get the system hostname
+fn get_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("COMPUTERNAME")) // Windows
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Network interface information
+#[derive(serde::Serialize)]
+struct NetworkInterface {
+    name: String,
+    mac: Option<String>,
+    ipv4: Vec<String>,
+    ipv6: Vec<String>,
+}
+
+/// Get network interface information including MAC addresses and IPs
+fn get_network_info() -> Vec<NetworkInterface> {
+    let mut interfaces = Vec::new();
+
+    // Read from /sys/class/net on Linux
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                // Skip loopback
+                if name == "lo" {
+                    continue;
+                }
+
+                // Get MAC address
+                let mac_path = entry.path().join("address");
+                let mac = std::fs::read_to_string(&mac_path)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| s != "00:00:00:00:00:00");
+
+                // Get IP addresses using ip command
+                let (ipv4, ipv6) = get_interface_ips(&name);
+
+                // Only include interfaces with MAC or IP
+                if mac.is_some() || !ipv4.is_empty() || !ipv6.is_empty() {
+                    interfaces.push(NetworkInterface {
+                        name,
+                        mac,
+                        ipv4,
+                        ipv6,
+                    });
+                }
+            }
+        }
+    }
+
+    // On non-Linux, try to get basic info from environment or commands
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Placeholder for Windows/macOS implementation
+        // Could use `ipconfig` on Windows or `ifconfig` on macOS
+    }
+
+    // Sort interfaces: tailscale first, then eth/en, then others
+    interfaces.sort_by(|a: &NetworkInterface, b: &NetworkInterface| {
+        let score = |name: &str| -> i32 {
+            if name.starts_with("tailscale") { 0 }
+            else if name.starts_with("eth") || name.starts_with("en") { 1 }
+            else if name.starts_with("wl") { 2 }
+            else { 3 }
+        };
+        score(&a.name).cmp(&score(&b.name))
+    });
+
+    interfaces
+}
+
+/// Get IPv4 and IPv6 addresses for an interface (Linux)
+#[cfg(target_os = "linux")]
+fn get_interface_ips(interface: &str) -> (Vec<String>, Vec<String>) {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+
+    // Try reading from /proc/net or using ip command output parsing
+    // Simple approach: read from ip addr show
+    if let Ok(output) = std::process::Command::new("ip")
+        .args(["addr", "show", interface])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.starts_with("inet ") {
+                // inet 192.168.1.100/24 brd 192.168.1.255 scope global
+                if let Some(addr) = line.split_whitespace().nth(1) {
+                    // Remove CIDR notation
+                    let ip = addr.split('/').next().unwrap_or(addr);
+                    ipv4.push(ip.to_string());
+                }
+            } else if line.starts_with("inet6 ") {
+                // inet6 fe80::1/64 scope link
+                if let Some(addr) = line.split_whitespace().nth(1) {
+                    let ip = addr.split('/').next().unwrap_or(addr);
+                    // Skip link-local unless it's the only one
+                    if !ip.starts_with("fe80:") {
+                        ipv6.push(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    (ipv4, ipv6)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_interface_ips(_interface: &str) -> (Vec<String>, Vec<String>) {
+    (Vec::new(), Vec::new())
+}
+
 async fn handle_read_file(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_read").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -828,6 +1231,11 @@ async fn handle_read_file(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_stat(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_stat").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -839,6 +1247,11 @@ async fn handle_stat(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_list(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_list").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -883,6 +1296,11 @@ async fn handle_list(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_exists(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_exists").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -894,6 +1312,11 @@ async fn handle_exists(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_search(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_search").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -919,6 +1342,11 @@ async fn handle_search(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_write_file(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_write").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -950,6 +1378,11 @@ async fn handle_write_file(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_mkdir(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_mkdir").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -970,6 +1403,11 @@ async fn handle_mkdir(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_delete(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_delete").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -990,6 +1428,11 @@ async fn handle_delete(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_rename(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_rename").await? {
+        return Ok(result);
+    }
+
     let from: PathBuf = args["from"]
         .as_str()
         .ok_or("from is required")?
@@ -1272,6 +1715,11 @@ const MAX_RESPONSE_SIZE: usize = 300_000; // 300KB - conservative for Claude Des
 const ESTIMATED_BYTES_PER_ENTRY: usize = 100;
 
 async fn handle_crawl(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_crawl").await? {
+        return Ok(result);
+    }
+
     // Defensive check for empty/null arguments
     if args.is_null() || (args.is_object() && args.as_object().map(|o| o.is_empty()).unwrap_or(false)) {
         tracing::warn!("ufm_crawl: received empty arguments");
@@ -1486,4 +1934,442 @@ async fn handle_hash_sample(state: Arc<ToolState>, args: Value) -> ToolResult {
         "errors": errors
     }))
     .map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// P2P Network Tool Handlers
+// ============================================================================
+
+async fn handle_nodes(state: Arc<ToolState>, args: Value) -> ToolResult {
+    let include_offline = args["include_offline"].as_bool().unwrap_or(false);
+
+    // Check if network service is available
+    if let Some(ref network) = state.network {
+        // Use actual network service
+        let all_nodes = network.peers.list_nodes().await;
+
+        let nodes: Vec<Value> = all_nodes
+            .iter()
+            .filter(|n| {
+                include_offline || matches!(
+                    n.status,
+                    PeerStatus::Connected | PeerStatus::Discovered
+                )
+            })
+            .map(|n| {
+                json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "uuid": n.uuid.to_string(),
+                    "addresses": n.addresses,
+                    "status": format!("{:?}", n.status).to_lowercase(),
+                    "latency_ms": n.latency_ms,
+                    "os": n.os,
+                    "version": n.version,
+                    "is_local": n.id == 0
+                })
+            })
+            .collect();
+
+        let connected = all_nodes.iter()
+            .filter(|n| matches!(n.status, PeerStatus::Connected))
+            .count();
+
+        Ok(json!({
+            "nodes": nodes,
+            "total": all_nodes.len(),
+            "connected": connected,
+            "network_enabled": network.enabled
+        }).to_string())
+    } else {
+        // Fallback: return local node info only
+        let hostname = get_hostname();
+        let uuid = get_or_create_node_uuid();
+
+        let local_node = json!({
+            "id": 0,
+            "name": hostname,
+            "uuid": uuid,
+            "addresses": ["local"],
+            "status": "connected",
+            "latency_ms": 0,
+            "os": std::env::consts::OS,
+            "version": env!("CARGO_PKG_VERSION"),
+            "is_local": true
+        });
+
+        Ok(json!({
+            "nodes": [local_node],
+            "total": 1,
+            "connected": 1,
+            "network_enabled": false,
+            "note": "P2P networking not initialized - run with --network flag to enable"
+        }).to_string())
+    }
+}
+
+async fn handle_ping(state: Arc<ToolState>, args: Value) -> ToolResult {
+    let node = &args["node"];
+    let count = args["count"].as_u64().unwrap_or(3) as u32;
+
+    // Parse node reference
+    let is_local = if node.is_null() {
+        true
+    } else if let Some(id) = node.as_u64() {
+        id == 0
+    } else if let Some(name) = node.as_str() {
+        name == "local" || name.is_empty() || name == "0"
+    } else {
+        false
+    };
+
+    if is_local {
+        // Local ping - instant response
+        let pings: Vec<u32> = (0..count).map(|_| 0).collect();
+        return Ok(json!({
+            "node": {
+                "id": 0,
+                "name": get_hostname(),
+                "uuid": get_or_create_node_uuid()
+            },
+            "pings": pings,
+            "avg_ms": 0,
+            "min_ms": 0,
+            "max_ms": 0,
+            "success": true,
+            "count": count
+        }).to_string());
+    }
+
+    // Remote ping - need network service
+    if let Some(ref network) = state.network {
+        // Parse node reference
+        let node_ref = if let Some(id) = node.as_u64() {
+            NodeRef::Id(id as u32)
+        } else if let Some(name) = node.as_str() {
+            // Try parsing as UUID first
+            if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+                NodeRef::Uuid(uuid)
+            } else {
+                NodeRef::Name(name.to_string())
+            }
+        } else {
+            return Err("Invalid node reference".to_string());
+        };
+
+        // Resolve to UUID
+        let peer_uuid = network.peers.resolve_node(&node_ref).await
+            .map_err(|e| format!("Node not found: {}", e))?;
+
+        // Get peer info for response
+        let nodes = network.peers.list_nodes().await;
+        let peer_info = nodes.iter().find(|n| n.uuid == peer_uuid);
+
+        // Perform pings
+        let mut pings = Vec::with_capacity(count as usize);
+        let mut failures = 0;
+
+        for _ in 0..count {
+            match network.peers.ping(peer_uuid).await {
+                Ok(latency) => pings.push(latency),
+                Err(_) => failures += 1,
+            }
+        }
+
+        if pings.is_empty() {
+            return Err(format!("All {} pings failed", count));
+        }
+
+        let avg = pings.iter().sum::<u32>() / pings.len() as u32;
+        let min = *pings.iter().min().unwrap_or(&0);
+        let max = *pings.iter().max().unwrap_or(&0);
+
+        Ok(json!({
+            "node": {
+                "id": peer_info.map(|p| p.id).unwrap_or(0),
+                "name": peer_info.map(|p| p.name.clone()).unwrap_or_else(|| "unknown".to_string()),
+                "uuid": peer_uuid.to_string()
+            },
+            "pings": pings,
+            "avg_ms": avg,
+            "min_ms": min,
+            "max_ms": max,
+            "success": true,
+            "count": count,
+            "failures": failures
+        }).to_string())
+    } else {
+        Err("P2P networking not initialized - run with --network flag to enable".to_string())
+    }
+}
+
+async fn handle_discover(state: Arc<ToolState>, args: Value) -> ToolResult {
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(5);
+
+    if let Some(ref network) = state.network {
+        // Perform discovery
+        let discovery = network.discovery.read().await;
+        let discovered = discovery.discover_now().await;
+
+        let peers: Vec<Value> = discovered.iter()
+            .map(|p| json!({
+                "name": p.name,
+                "uuid": p.uuid.map(|u| u.to_string()),
+                "addresses": p.addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "version": p.version,
+                "os": p.os,
+                "source": format!("{:?}", p.source).to_lowercase()
+            }))
+            .collect();
+
+        Ok(json!({
+            "discovered": peers,
+            "count": peers.len(),
+            "timeout_secs": timeout_secs,
+            "methods": {
+                "mdns": network.config.discovery.mdns_enabled,
+                "bootstrap": !network.config.discovery.bootstrap_nodes.is_empty()
+            }
+        }).to_string())
+    } else {
+        Ok(json!({
+            "discovered": [],
+            "count": 0,
+            "timeout_secs": timeout_secs,
+            "methods": {
+                "mdns": false,
+                "bootstrap": false
+            },
+            "note": "P2P networking not initialized - run with --network flag to enable"
+        }).to_string())
+    }
+}
+
+/// Get or create a persistent node UUID
+fn get_or_create_node_uuid() -> String {
+    // Try to read from identity file first
+    let identity_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("ufm")
+        .join("identity.json");
+
+    if let Ok(data) = std::fs::read_to_string(&identity_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(uuid) = json["uuid"].as_str() {
+                return uuid.to_string();
+            }
+        }
+    }
+
+    // Generate a deterministic UUID from hostname for now
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let hostname = get_hostname();
+    let mut hasher = DefaultHasher::new();
+    hostname.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    // Create a UUID-like string from the hash
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (hash >> 32) as u32,
+        ((hash >> 16) & 0xFFFF) as u16,
+        (hash & 0xFFFF) as u16,
+        ((hash >> 48) & 0xFFFF) as u16,
+        hash & 0xFFFFFFFFFFFF
+    )
+}
+
+// ============================================================================
+// Transfer Tool Handlers
+// ============================================================================
+
+async fn handle_transfer(state: Arc<ToolState>, args: Value) -> ToolResult {
+    let source_path = args["source_path"]
+        .as_str()
+        .ok_or("source_path is required")?;
+
+    let dest_path = args["dest_path"]
+        .as_str()
+        .ok_or("dest_path is required")?;
+
+    // Parse source and dest nodes
+    let source_node = {
+        let node = &args["source_node"];
+        if node.is_null() {
+            NodeRef::Local
+        } else if let Some(id) = node.as_u64() {
+            if id == 0 { NodeRef::Local } else { NodeRef::Id(id as u32) }
+        } else if let Some(s) = node.as_str() {
+            if s.is_empty() || s == "local" || s == "0" {
+                NodeRef::Local
+            } else if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+                NodeRef::Uuid(uuid)
+            } else {
+                NodeRef::Name(s.to_string())
+            }
+        } else {
+            NodeRef::Local
+        }
+    };
+
+    let dest_node = {
+        let node = &args["dest_node"];
+        if node.is_null() {
+            NodeRef::Local
+        } else if let Some(id) = node.as_u64() {
+            if id == 0 { NodeRef::Local } else { NodeRef::Id(id as u32) }
+        } else if let Some(s) = node.as_str() {
+            if s.is_empty() || s == "local" || s == "0" {
+                NodeRef::Local
+            } else if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+                NodeRef::Uuid(uuid)
+            } else {
+                NodeRef::Name(s.to_string())
+            }
+        } else {
+            NodeRef::Local
+        }
+    };
+
+    let compression = match args["compression"].as_str() {
+        Some("none") => crate::network::Compression::None,
+        Some("gzip") => crate::network::Compression::Gzip,
+        Some("zstd") | None => crate::network::Compression::Zstd,
+        Some(other) => return Err(format!("Unknown compression: {}", other)),
+    };
+
+    // Check if this is a local-to-local transfer (just use regular copy)
+    let source_is_local = matches!(source_node, NodeRef::Local);
+    let dest_is_local = matches!(dest_node, NodeRef::Local);
+
+    if source_is_local && dest_is_local {
+        // Simple local copy
+        let from = PathBuf::from(source_path);
+        let to = PathBuf::from(dest_path);
+
+        let options = CopyOptions {
+            overwrite: true,
+            recursive: false,
+            preserve_metadata: true,
+        };
+
+        let copied = state.file_manager.copy(&from, &to, &options)
+            .map_err(|e| e.to_string())?;
+
+        return Ok(json!({
+            "success": true,
+            "transfer_type": "local",
+            "bytes_copied": copied,
+            "source": source_path,
+            "dest": dest_path
+        }).to_string());
+    }
+
+    // Remote transfer - need network service
+    let network = state.network.as_ref()
+        .ok_or("P2P networking not enabled - run with --network flag")?;
+
+    // For now, implement a simple pull-from-remote or push-to-remote
+    // Full P2P relay transfers would need more infrastructure
+
+    if source_is_local && !dest_is_local {
+        // Push to remote: read local file and send via ufm_write tool on remote
+        let content = tokio::fs::read(source_path).await
+            .map_err(|e| format!("Failed to read source file: {}", e))?;
+
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &content);
+
+        let remote_args = json!({
+            "path": dest_path,
+            "content": encoded,
+            "from_base64": true,
+            "node": args["dest_node"]
+        });
+
+        // Route to remote
+        let result = network.router.route_tool_request(&dest_node, "ufm_write", remote_args).await
+            .map_err(|e| format!("Remote write failed: {}", e))?;
+
+        match result {
+            Some(crate::network::protocol::ToolResult::Success(_)) => {
+                Ok(json!({
+                    "success": true,
+                    "transfer_type": "push",
+                    "bytes_transferred": content.len(),
+                    "source": source_path,
+                    "dest": dest_path,
+                    "compression": format!("{:?}", compression).to_lowercase()
+                }).to_string())
+            }
+            Some(crate::network::protocol::ToolResult::Error(e)) => Err(e),
+            None => Err("Unexpected local routing for remote transfer".to_string()),
+        }
+    } else if !source_is_local && dest_is_local {
+        // Pull from remote: use ufm_read tool on remote, then write locally
+        let remote_args = json!({
+            "path": source_path,
+            "as_base64": true,
+            "node": args["source_node"]
+        });
+
+        let result = network.router.route_tool_request(&source_node, "ufm_read", remote_args).await
+            .map_err(|e| format!("Remote read failed: {}", e))?;
+
+        let content = match result {
+            Some(crate::network::protocol::ToolResult::Success(data)) => {
+                // Parse the response - it should be base64 content
+                let response: serde_json::Value = serde_json::from_str(&data.to_string())
+                    .map_err(|_| "Failed to parse remote response")?;
+                let encoded = response["content"].as_str()
+                    .ok_or("Remote response missing content")?;
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                    .map_err(|e| format!("Failed to decode content: {}", e))?
+            }
+            Some(crate::network::protocol::ToolResult::Error(e)) => return Err(e),
+            None => return Err("Unexpected local routing for remote transfer".to_string()),
+        };
+
+        // Write locally
+        let dest = PathBuf::from(dest_path);
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| format!("Failed to create parent directories: {}", e))?;
+        }
+        tokio::fs::write(&dest, &content).await
+            .map_err(|e| format!("Failed to write destination file: {}", e))?;
+
+        Ok(json!({
+            "success": true,
+            "transfer_type": "pull",
+            "bytes_transferred": content.len(),
+            "source": source_path,
+            "dest": dest_path,
+            "compression": format!("{:?}", compression).to_lowercase()
+        }).to_string())
+    } else {
+        // Remote-to-remote transfer - would need relay or direct P2P
+        Err("Remote-to-remote transfers not yet implemented - transfer to local first".to_string())
+    }
+}
+
+async fn handle_transfer_status(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // For now, we don't have a TransferManager in ToolState
+    // This is a placeholder for when we add full streaming transfer support
+
+    let transfer_id = args["transfer_id"].as_u64();
+
+    if let Some(_id) = transfer_id {
+        // Would look up specific transfer
+        Ok(json!({
+            "error": "Transfer tracking not yet implemented - transfers complete synchronously"
+        }).to_string())
+    } else {
+        // List all transfers
+        Ok(json!({
+            "transfers": [],
+            "note": "Transfer tracking not yet implemented - transfers complete synchronously"
+        }).to_string())
+    }
 }

@@ -163,11 +163,11 @@ pub mod unix {
 // ============================================================================
 
 #[cfg(windows)]
-pub mod windows {
+pub mod win {
     use super::*;
     use std::fs;
     use std::os::windows::fs::MetadataExt;
-    
+
     // Windows file attributes
     pub const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
     pub const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
@@ -177,37 +177,35 @@ pub mod windows {
     pub const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
     pub const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
     pub const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x2000;
-    
+
     /// Get Windows file attributes
     pub fn get_attributes(path: &Path) -> Result<u32> {
         let metadata = fs::metadata(path)?;
         Ok(metadata.file_attributes())
     }
-    
+
     /// Set Windows file attributes
     pub fn set_attributes(path: &Path, attrs: u32) -> Result<()> {
-        use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
-        
+
         let wide_path: Vec<u16> = path.as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        
+
         unsafe {
-            use windows::Win32::Storage::FileSystem::SetFileAttributesW;
-            use windows::core::PCWSTR;
-            
-            let result = SetFileAttributesW(
+            use ::windows::Win32::Storage::FileSystem::SetFileAttributesW;
+            use ::windows::core::PCWSTR;
+
+            SetFileAttributesW(
                 PCWSTR(wide_path.as_ptr()),
-                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(attrs),
-            );
-            
-            if !result.as_bool() {
-                return Err(PlatformError::Io(std::io::Error::last_os_error()));
-            }
+                ::windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(attrs),
+            ).map_err(|e| PlatformError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string()
+            )))?;
         }
-        
+
         Ok(())
     }
     
@@ -344,12 +342,12 @@ impl FileAttributes {
         
         #[cfg(windows)]
         {
-            let attrs = windows::get_attributes(path)?;
+            let attrs = win::get_attributes(path)?;
             Ok(Self {
-                readonly: attrs & windows::FILE_ATTRIBUTE_READONLY != 0,
-                hidden: attrs & windows::FILE_ATTRIBUTE_HIDDEN != 0,
-                system: attrs & windows::FILE_ATTRIBUTE_SYSTEM != 0,
-                archive: attrs & windows::FILE_ATTRIBUTE_ARCHIVE != 0,
+                readonly: attrs & win::FILE_ATTRIBUTE_READONLY != 0,
+                hidden: attrs & win::FILE_ATTRIBUTE_HIDDEN != 0,
+                system: attrs & win::FILE_ATTRIBUTE_SYSTEM != 0,
+                archive: attrs & win::FILE_ATTRIBUTE_ARCHIVE != 0,
             })
         }
         
@@ -386,12 +384,12 @@ impl FileAttributes {
         #[cfg(windows)]
         {
             let mut attrs = 0u32;
-            if self.readonly { attrs |= windows::FILE_ATTRIBUTE_READONLY; }
-            if self.hidden { attrs |= windows::FILE_ATTRIBUTE_HIDDEN; }
-            if self.system { attrs |= windows::FILE_ATTRIBUTE_SYSTEM; }
-            if self.archive { attrs |= windows::FILE_ATTRIBUTE_ARCHIVE; }
-            
-            windows::set_attributes(path, attrs)?;
+            if self.readonly { attrs |= win::FILE_ATTRIBUTE_READONLY; }
+            if self.hidden { attrs |= win::FILE_ATTRIBUTE_HIDDEN; }
+            if self.system { attrs |= win::FILE_ATTRIBUTE_SYSTEM; }
+            if self.archive { attrs |= win::FILE_ATTRIBUTE_ARCHIVE; }
+
+            win::set_attributes(path, attrs)?;
         }
         
         Ok(())
@@ -411,7 +409,7 @@ pub fn set_folder_appearance(path: &Path, color: Option<&str>, icon: Option<&Pat
     #[cfg(windows)]
     {
         if let Some(icon_path) = icon {
-            windows::set_folder_icon(path, icon_path, 0)?;
+            win::set_folder_icon(path, icon_path, 0)?;
         }
         if color.is_some() {
             // Windows doesn't support native folder colors

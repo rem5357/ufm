@@ -11,18 +11,22 @@
 mod archive;
 mod crawler;
 mod mcp;
+mod network;
 mod operations;
 mod platform;
 mod security;
 mod tools;
+mod update;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::mcp::run_stdio_server;
+use crate::network::{NetworkConfig, NetworkService};
 use crate::security::SecurityPolicy;
 use crate::tools::UfmServer;
 
@@ -52,6 +56,31 @@ struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Enable P2P networking for cross-machine file operations
+    #[arg(long)]
+    network: bool,
+
+    /// P2P listen port (default: 9847)
+    #[arg(long, default_value = "9847")]
+    port: u16,
+
+    /// Custom node name for P2P network (defaults to hostname)
+    #[arg(long)]
+    node_name: Option<String>,
+
+    /// Check for updates and exit
+    #[arg(long)]
+    check_update: bool,
+
+    /// Download and apply available update
+    #[arg(long)]
+    update: bool,
+
+    /// Run as a daemon (P2P network only, no MCP server)
+    /// Use this on headless servers that don't run Claude Desktop
+    #[arg(long)]
+    daemon: bool,
 }
 
 /// Configuration for UFM
@@ -229,6 +258,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Handle --check-update flag
+    if args.check_update {
+        println!("UFM v{}", full_version());
+        println!("Checking for updates...");
+        let update_config = update::UpdateConfig::default();
+        match update::check_for_update(&update_config).await {
+            update::UpdateStatus::UpToDate => {
+                println!("You are running the latest version.");
+            }
+            update::UpdateStatus::UpdateAvailable(info) => {
+                println!("Update available: v{} (build {})", info.version, info.build);
+                if let Some(notes) = &info.release_notes {
+                    println!("Release notes: {}", notes);
+                }
+                println!("\nRun 'ufm --update' to download and install the update.");
+            }
+            update::UpdateStatus::CheckFailed(err) => {
+                eprintln!("Failed to check for updates: {}", err);
+            }
+        }
+        return Ok(());
+    }
+
+    // Handle --update flag
+    if args.update {
+        println!("UFM v{}", full_version());
+        println!("Checking for updates...");
+        let update_config = update::UpdateConfig::default();
+        match update::check_for_update(&update_config).await {
+            update::UpdateStatus::UpToDate => {
+                println!("You are already running the latest version.");
+            }
+            update::UpdateStatus::UpdateAvailable(info) => {
+                println!("Downloading update: v{} (build {})", info.version, info.build);
+                match update::apply_update(&info).await {
+                    Ok(()) => {
+                        println!("Update downloaded successfully!");
+                        println!("Please restart UFM to complete the update.");
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to apply update: {}", e);
+                        return Err(e.into());
+                    }
+                }
+            }
+            update::UpdateStatus::CheckFailed(err) => {
+                eprintln!("Failed to check for updates: {}", err);
+            }
+        }
+        return Ok(());
+    }
+
     // Load configuration
     let config = if let Some(config_path) = &args.config {
         Config::load(config_path)?
@@ -312,12 +393,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the UFM server
     let policy = config.to_security_policy();
-    let ufm_server = UfmServer::new(
-        policy,
-        config.name.clone(),
-        config.version.clone(),
-        BUILD_NUMBER.to_string(),
-    );
+
+    let ufm_server = if args.network {
+        // Initialize P2P networking
+        tracing::info!("Initializing P2P networking on port {}", args.port);
+
+        let mut network_config = NetworkConfig::default();
+        network_config.enabled = true;
+        network_config.listen_port = args.port;
+
+        // Use custom node name if provided
+        if let Some(name) = args.node_name {
+            // We'll override the identity name after creation
+            tracing::info!("Using custom node name: {}", name);
+        }
+
+        let network_service = match NetworkService::new(network_config).await {
+            Ok(service) => {
+                // Start the network service
+                if let Err(e) = service.start().await {
+                    tracing::error!("Failed to start network service: {}", e);
+                    return Err(e.into());
+                }
+                tracing::info!("P2P network started - Node: {} ({})",
+                    service.identity.name,
+                    service.identity.uuid
+                );
+                Arc::new(service)
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize network: {}", e);
+                return Err(e.into());
+            }
+        };
+
+        UfmServer::with_network(
+            policy,
+            config.name.clone(),
+            config.version.clone(),
+            BUILD_NUMBER.to_string(),
+            network_service,
+        )
+    } else {
+        UfmServer::new(
+            policy,
+            config.name.clone(),
+            config.version.clone(),
+            BUILD_NUMBER.to_string(),
+        )
+    };
+
+    // Daemon mode: run P2P network only, no MCP server
+    if args.daemon {
+        if !args.network {
+            eprintln!("Error: --daemon requires --network flag");
+            std::process::exit(1);
+        }
+
+        tracing::info!("Running in daemon mode (P2P network only)");
+        println!("UFM daemon started - Node: {}",
+            ufm_server.state.network.as_ref()
+                .map(|n| n.identity.name.as_str())
+                .unwrap_or("unknown"));
+        println!("Listening for P2P connections on port {}", args.port);
+        println!("Press Ctrl+C to stop");
+
+        // Wait for shutdown signal
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("Shutdown signal received, stopping...");
+        return Ok(());
+    }
 
     tracing::info!("UFM ready, waiting for MCP client connection...");
 

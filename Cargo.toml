@@ -69,8 +69,29 @@ infer = "0.16"                     # Detect file type by magic bytes
 encoding_rs = "0.8"                # Text encoding detection
 
 # Fast hashing (for crawler tools)
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
 sha2 = "0.10"
+hex = "0.4"
+
+# P2P Networking
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+mdns-sd = "0.11"
+bimap = "0.6"
+hostname = "0.4"
+
+# Binary serialization for peer protocol
+bincode = "1.3"
+
+# Compression for streaming transfers
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
+zstd = "0.13"
+
+# Streaming tar archives
+tokio-tar = "0.3"
+
+# HTTP client for auto-update
+reqwest = { version = "0.12", features = ["json"] }
 
 # Platform-specific features
 [target.'cfg(unix)'.dependencies]
