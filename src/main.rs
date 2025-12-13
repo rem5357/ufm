@@ -443,6 +443,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
 
+    // Check for updates on startup
+    // Auto-apply in daemon mode, just notify in MCP mode
+    let update_config = update::UpdateConfig::default();
+    update::check_on_startup(&update_config, args.daemon).await;
+
+    // Spawn background update checker (only useful in daemon mode for periodic checks)
+    let _update_handle = update::spawn_update_checker(update_config);
+
     // Daemon mode: run P2P network only, no MCP server
     if args.daemon {
         if !args.network {

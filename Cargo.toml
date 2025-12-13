@@ -1,6 +1,6 @@
 [package]
 name = "ufm"
-version = "0.11.0"
+version = "0.50.0"
 edition = "2021"
 description = "Universal File Manager - Cross-platform MCP file management server"
 authors = ["Robert"]

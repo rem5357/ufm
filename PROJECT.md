@@ -15,11 +15,114 @@
 
 ## Project Status
 
-**Version**: 0.11.0
-**Build**: 27
+**Version**: 0.50.0
+**Build**: 77
 **Status**: Active Development
 
 ## Development History
+
+### Session 4: P2P Networking and Auto-Update System (2025-12-12)
+
+#### Major Features Implemented
+
+1. **P2P Networking Infrastructure**
+   - mDNS service discovery for local network peer detection
+   - Node identity system with UUID and human-readable names
+   - Peer connection management with handshake protocol
+   - Binary message protocol with compression support (gzip, zstd)
+   - Transfer manager for file streaming between nodes
+
+2. **Auto-Update System**
+   - Automatic update checking on startup
+   - Periodic background update checks (hourly check, daily download)
+   - Platform-specific binary downloads (Windows `.exe`, Linux binary)
+   - SHA256 checksum verification before applying updates
+   - Atomic binary replacement with backup creation
+
+3. **Daemon Mode**
+   - `--daemon` flag for headless server operation
+   - Runs P2P network only (no MCP server)
+   - Auto-applies updates and restarts via systemd
+   - Designed for always-on home servers
+
+#### Problems Encountered and Solutions
+
+1. **Wrong Platform Binary Download**
+   - **Issue**: Linux daemon was downloading Windows `ufm.exe` instead of Linux binary
+   - **Root Cause**: `version.json` had `download_url` pointing to Windows binary, and code used that for all platforms
+   - **Solution**: Added `linux_download_url` and `linux_checksum` fields to `version.json`, plus `platform_download_url()` and `platform_checksum()` methods in `VersionInfo`
+
+2. **Permission Denied on Binary Update**
+   - **Issue**: Daemon couldn't write to `/usr/local/bin/ufm`
+   - **Root Cause**: Running as non-root user
+   - **Solution**: Moved UFM installation to `~/.local/bin/ufm` (user-writable)
+
+3. **Backup File Naming on Linux**
+   - **Issue**: Was creating `ufm.exe.bak` on Linux
+   - **Solution**: Platform-specific backup naming (`ufm.bak` on Unix, `ufm.exe.bak` on Windows)
+
+4. **Executable Path Shows "(deleted)" After Replacement**
+   - **Issue**: `std::env::current_exe()` returns path with " (deleted)" suffix after file replacement
+   - **Root Cause**: Linux kernel marks the path when the running binary's file is replaced
+   - **Solution**: Initially tried string parsing; later abandoned for different approach
+
+5. **exec() Runs Old Binary from Memory Cache (CRITICAL)**
+   - **Issue**: After replacing binary and calling `exec()`, the OLD binary code still ran
+   - **Root Cause**: Linux caches the running executable in memory. Even after file replacement, `exec()` on the same path loads from memory cache, not disk
+   - **Solution**: Changed `restart_self()` to simply `exit(0)` and let systemd restart the service, which loads fresh from disk
+
+6. **Infinite Update Loop (CRITICAL)**
+   - **Issue**: After successful update, daemon kept restarting and re-downloading
+   - **Root Cause**: Build number is compiled into binary at build time (`env!("UFM_BUILD_NUMBER")`). When a binary built as "build 73" is replaced with server's "build 74" binary, the NEW binary still reports "build 73" (its own compiled-in value). Version check sees 73 < 74 and triggers another update
+   - **Solution**: Added checksum-based update detection. Before comparing build numbers, compute SHA256 of the running binary and compare to server's checksum. If checksums match, binary is already correct—no update needed. This is immune to build number mismatches.
+
+#### Key Code Changes
+
+**`src/update.rs`**:
+- `check_for_update()`: Now computes running binary's checksum first
+- `get_current_binary_checksum()`: New function to hash current executable
+- `platform_download_url()` / `platform_checksum()`: Platform-specific URL/checksum getters
+- `check_on_startup()`: Auto-apply support for daemon mode
+- `spawn_update_checker()`: Background periodic update task
+- `restart_self()`: Platform-specific restart (exit on Unix, script on Windows)
+
+**`src/main.rs`**:
+- Added `--daemon` flag for headless operation
+- Added `--check-update` and `--update` flags for manual update control
+- Integrated startup and background update checking
+
+**`/etc/systemd/system/ufm.service`**:
+- `Restart=always` to restart after update exits
+- `RestartSec=2` for quick recovery
+- Runs from `~/.local/bin/ufm`
+
+#### Lessons Learned
+
+1. **Linux Executable Memory Caching**
+   - Linux caches running executables in memory even after file replacement
+   - You cannot use `exec()` to "reload" a binary that was just replaced on disk
+   - The only reliable way to run updated code is to fully exit and let an external process (systemd, init, etc.) start fresh
+
+2. **Build Numbers vs Checksums for Updates**
+   - Compiled-in build numbers are unreliable for update detection when binaries are replaced without restarting
+   - Checksum comparison is authoritative: if checksums match, binaries are identical
+   - Build numbers are still useful for human-readable version display
+
+3. **Platform-Specific Update Handling**
+   - Windows: Can't replace running executable, need helper script
+   - Linux: Can replace file, but must exit+restart to load new code
+   - Always have a backup strategy
+
+4. **systemd Integration**
+   - `Restart=always` with `RestartSec=N` is ideal for self-updating daemons
+   - Exit code 0 is fine; systemd will restart regardless with `Restart=always`
+
+#### Files Modified
+
+- `src/update.rs` - New file for auto-update functionality
+- `src/main.rs` - Integrated update system, added daemon mode
+- `dist/linux/ufm.service` - systemd service template
+- `Cargo.toml` - Added reqwest dependency for HTTP
 
 ### Session 3: Crawl Reliability and Performance (2025-12-11)
 
@@ -281,24 +384,35 @@ Run with: `ufm --config ufm.debug.toml`
 - Dead code from partial implementations
 - These don't affect functionality, cleanup planned for 1.0
 
-## Future Enhancements
+## TODO and Next Steps
+
+### Immediate (Testing Required)
+
+- [ ] Test auto-update on Windows (helper script approach)
+- [ ] Test P2P peer discovery across different machines
+- [ ] Test file transfer between peers
+- [ ] Verify update server checksum workflow (build → deploy → update cycle)
+- [ ] Test daemon mode restart behavior under various failure conditions
 
 ### High Priority
 
+- [ ] Complete P2P file transfer implementation (currently scaffolded)
+- [ ] Add peer authentication (shared secret or certificate-based)
+- [ ] Implement remote file operations via P2P (ufm_remote_read, etc.)
 - [ ] Binary serialization support (bincode/MessagePack) for Rust-to-Rust
-- [ ] Streaming output mode for real-time results
-- [ ] Compression options (lz4/zstd) for data streams
-- [ ] USM client/server architecture integration
+- [ ] Windows installer with auto-update support
 
 ### Medium Priority
 
-- [ ] Test suite improvements
-- [ ] CI/CD pipeline (GitHub Actions)
-- [ ] Performance benchmarks
-- [ ] Plugin system for custom tools
+- [ ] Test suite improvements (especially for update system)
+- [ ] CI/CD pipeline (GitHub Actions) for automated builds
+- [ ] Performance benchmarks for P2P transfers
+- [ ] Rate limiting on update checks
+- [ ] Update server redundancy (multiple mirrors)
 
 ### Low Priority
 
+- [ ] Web UI for daemon status/control
 - [ ] Remote file access (WebDAV, SFTP)
 - [ ] File watching capabilities
 - [ ] Trash/recycle bin support
@@ -308,10 +422,40 @@ Run with: `ufm --config ufm.debug.toml`
 
 ### Current System
 
-- **Version**: Managed in Cargo.toml (0.11.0)
-- **Build Number**: Stored in `BUILD` file (currently: 27)
+- **Version**: Managed in Cargo.toml (0.50.0)
+- **Build Number**: Stored in `BUILD` file, auto-incremented on each build
 - **Build Script**: `build.rs` reads BUILD file and sets `UFM_BUILD_NUMBER` env var
-- **Display**: `full_version()` returns "0.11.0 (build 27)"
+- **Display**: `full_version()` returns "0.50.0 (build N)"
+
+### Update Server Structure
+
+The update server (`http://goldshire:8080/ufm/`) hosts:
+- `version.json` - Version metadata with checksums
+- `ufm.exe` - Windows binary
+- `ufm-linux-x86_64` - Linux binary
+
+**version.json format**:
+```json
+{
+  "version": "0.50.0",
+  "build": 77,
+  "download_url": "http://goldshire:8080/ufm/ufm.exe",
+  "checksum": "<sha256 of Windows binary>",
+  "linux_download_url": "http://goldshire:8080/ufm/ufm-linux-x86_64",
+  "linux_checksum": "<sha256 of Linux binary>",
+  "release_notes": "Description of changes",
+  "min_version": null
+}
+```
+
+### Deployment Workflow
+
+1. Increment version in `Cargo.toml` if needed
+2. `cargo build --release` (auto-increments BUILD file)
+3. Calculate checksums: `sha256sum target/release/ufm`
+4. Copy binaries to update server: `/var/www/ufm/`
+5. Update `version.json` with new build number and checksums
+6. Running daemons will auto-update on next check (or restart)
 
 ### Building
 
@@ -350,6 +494,6 @@ MIT License - See LICENSE file for details
 
 ---
 
-**Last Updated**: 2025-12-11
+**Last Updated**: 2025-12-12
 **Maintainer**: Robert
 **Repository**: https://github.com/rem5357/ufm
