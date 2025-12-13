@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::config::DiscoveryConfig;
 use super::identity::NodeIdentity;
 use super::peer::PeerManager;
-use super::protocol::{DiscoveredPeer, DiscoverySource, PeerMessage, PROTOCOL_VERSION};
+use super::protocol::{DiscoveredPeer, DiscoverySource, PeerMessage};
 
 /// Manages peer discovery via multiple methods
 pub struct DiscoveryManager {
@@ -21,6 +21,7 @@ pub struct DiscoveryManager {
     peer_manager: Arc<PeerManager>,
     config: DiscoveryConfig,
     mdns_daemon: Option<ServiceDaemon>,
+    mdns_receiver: Option<mdns_sd::Receiver<ServiceEvent>>,
     running: bool,
 }
 
@@ -36,6 +37,7 @@ impl DiscoveryManager {
             peer_manager,
             config,
             mdns_daemon: None,
+            mdns_receiver: None,
             running: false,
         }
     }
@@ -96,6 +98,11 @@ impl DiscoveryManager {
         daemon.register(service)?;
         tracing::info!("mDNS service registered: {}", instance_name);
 
+        // Create browse receiver once - don't call browse() repeatedly
+        let receiver = daemon.browse(service_type)?;
+        tracing::info!("mDNS browse started for: {}", service_type);
+
+        self.mdns_receiver = Some(receiver);
         self.mdns_daemon = Some(daemon);
         Ok(())
     }
@@ -105,7 +112,7 @@ impl DiscoveryManager {
         let peer_manager = self.peer_manager.clone();
         let config = self.config.clone();
         let identity = self.identity.clone();
-        let mdns_daemon = self.mdns_daemon.as_ref().map(|d| d.clone());
+        let mdns_receiver = self.mdns_receiver.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(config.discovery_interval());
@@ -113,9 +120,9 @@ impl DiscoveryManager {
             loop {
                 interval.tick().await;
 
-                // mDNS discovery
-                if let Some(ref daemon) = mdns_daemon {
-                    if let Ok(peers) = discover_mdns(daemon, &config.mdns_service_type, &identity).await {
+                // mDNS discovery - use the persistent receiver
+                if let Some(ref receiver) = mdns_receiver {
+                    if let Ok(peers) = collect_mdns_peers(receiver, &identity).await {
                         for peer in peers {
                             peer_manager.add_discovered_peer(peer).await;
                         }
@@ -138,9 +145,9 @@ impl DiscoveryManager {
     pub async fn discover_now(&self) -> Vec<DiscoveredPeer> {
         let mut all_peers = Vec::new();
 
-        // mDNS
-        if let Some(ref daemon) = self.mdns_daemon {
-            if let Ok(peers) = discover_mdns(daemon, &self.config.mdns_service_type, &self.identity).await {
+        // mDNS - use the persistent receiver
+        if let Some(ref receiver) = self.mdns_receiver {
+            if let Ok(peers) = collect_mdns_peers(receiver, &self.identity).await {
                 all_peers.extend(peers);
             }
         }
@@ -161,15 +168,15 @@ impl DiscoveryManager {
     }
 }
 
-/// Discover peers via mDNS
-async fn discover_mdns(
-    daemon: &ServiceDaemon,
-    service_type: &str,
+/// Collect peers from an existing mDNS receiver (non-blocking drain)
+async fn collect_mdns_peers(
+    receiver: &mdns_sd::Receiver<ServiceEvent>,
     our_identity: &NodeIdentity,
 ) -> anyhow::Result<Vec<DiscoveredPeer>> {
-    let receiver = daemon.browse(service_type)?;
     let mut peers = Vec::new();
 
+    // Drain any pending events from the receiver (non-blocking)
+    // We use try_recv to avoid blocking, collecting what's available
     let timeout = Duration::from_secs(3);
     let start = std::time::Instant::now();
 
