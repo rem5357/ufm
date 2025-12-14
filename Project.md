@@ -60,7 +60,8 @@ Debugged and fixed multiple issues with P2P networking between UFM nodes (Falcon
 
 #### High Priority
 - [ ] **Pull transfers still use base64**: Pull operations (`!source_is_local && dest_is_local`) use `ufm_read` with base64 encoding through tool responses. Should implement streaming pull like we have for push.
-- [ ] **Test the full transfer flow**: With build 115, Falcon needs to update and retry the transfer to verify everything works end-to-end.
+- [x] **Test the full transfer flow**: ~~With build 115, Falcon needs to update and retry the transfer to verify everything works end-to-end.~~ DONE - 67KB transfer successful.
+- [ ] **Eliminate bootstrap nodes**: Make node detection completely dynamic. No hardcoded bootstrap addresses - nodes should discover each other automatically via mDNS or other zero-config methods.
 
 #### Medium Priority
 - [ ] **Remote-to-remote transfers**: Currently returns "not yet implemented". Would need relay or direct P2P negotiation.
