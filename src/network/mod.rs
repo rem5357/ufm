@@ -12,8 +12,8 @@ pub mod config;
 pub mod transfer;
 
 pub use identity::{NodeIdentity, Capability};
-pub use protocol::{PeerMessage, PROTOCOL_VERSION};
-pub use peer::{PeerManager, PeerInfo, PeerStatus, NodeRef};
+pub use protocol::{PeerMessage, ToolResult, PROTOCOL_VERSION};
+pub use peer::{PeerManager, PeerInfo, PeerStatus, NodeRef, ToolExecutor};
 pub use discovery::DiscoveryManager;
 pub use router::RequestRouter;
 pub use config::{NetworkConfig, DiscoveryConfig, TransferConfig, Compression};

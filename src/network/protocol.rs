@@ -55,7 +55,8 @@ pub enum PeerMessage {
     ToolRequest {
         id: u64,
         tool: String,
-        params: serde_json::Value,
+        /// JSON-serialized parameters (bincode can't handle serde_json::Value directly)
+        params_json: String,
     },
 
     /// Tool execution result
@@ -141,7 +142,8 @@ pub enum PeerMessage {
 /// Result of a tool execution
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ToolResult {
-    Success(serde_json::Value),
+    /// JSON-serialized success result (bincode can't handle serde_json::Value directly)
+    Success(String),
     Error(String),
 }
 

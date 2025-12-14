@@ -457,7 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.name.clone(),
             config.version.clone(),
             BUILD_NUMBER.to_string(),
-            network_service,
+            network_service.clone(),
         )
     } else {
         UfmServer::new(
@@ -467,6 +467,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             BUILD_NUMBER.to_string(),
         )
     };
+
+    // Wire up the tool executor for handling incoming remote tool requests
+    if let Some(ref network) = ufm_server.state.network {
+        network.peers.set_tool_executor(ufm_server.tool_executor()).await;
+        tracing::debug!("Tool executor wired up for remote tool requests");
+    }
 
     // Check for updates on startup
     // Auto-apply in daemon mode, just notify in MCP mode

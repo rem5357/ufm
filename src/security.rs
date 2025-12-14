@@ -79,29 +79,47 @@ impl Default for SecurityPolicy {
 impl SecurityPolicy {
     /// Create a new security policy with specified allowed roots
     pub fn new(allowed_roots: Vec<PathBuf>) -> Self {
+        // Normalize and canonicalize allowed roots for consistent comparison
+        let normalized_roots: Vec<PathBuf> = allowed_roots
+            .into_iter()
+            .filter_map(|root| Self::normalize_root(&root))
+            .collect();
         Self {
-            allowed_roots,
+            allowed_roots: normalized_roots,
             ..Default::default()
         }
     }
-    
+
     /// Create a permissive policy (for trusted environments)
     /// Still blocks system-critical paths
     pub fn permissive() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let normalized = Self::normalize_root(&home).unwrap_or(home);
         Self {
-            allowed_roots: vec![home],
+            allowed_roots: vec![normalized],
             ..Default::default()
         }
     }
-    
+
     /// Create a restrictive policy for a specific directory
     pub fn sandboxed(root: PathBuf) -> Self {
+        let normalized = Self::normalize_root(&root).unwrap_or(root);
         Self {
-            allowed_roots: vec![root],
+            allowed_roots: vec![normalized],
             allow_chmod: false,
             follow_symlinks: false,
             ..Default::default()
+        }
+    }
+
+    /// Normalize a root path for consistent comparison
+    fn normalize_root(path: &Path) -> Option<PathBuf> {
+        // Try to canonicalize if the path exists
+        if path.exists() {
+            path.canonicalize().ok()
+        } else {
+            // For non-existent paths, just clean them up
+            Some(clean_path(path))
         }
     }
     
@@ -134,7 +152,9 @@ impl SecurityPolicy {
     
     /// Add an allowed root directory
     pub fn add_allowed_root(&mut self, root: PathBuf) {
-        self.allowed_roots.push(root);
+        if let Some(normalized) = Self::normalize_root(&root) {
+            self.allowed_roots.push(normalized);
+        }
     }
     
     /// Add a denied path
@@ -267,9 +287,19 @@ impl SecurityPolicy {
             // No roots specified = nothing allowed
             return false;
         }
-        
+
         self.allowed_roots.iter().any(|root| {
-            path.starts_with(root)
+            // On Windows, paths are case-insensitive
+            #[cfg(windows)]
+            {
+                let path_lower = path.to_string_lossy().to_lowercase();
+                let root_lower = root.to_string_lossy().to_lowercase();
+                path_lower.starts_with(&root_lower)
+            }
+            #[cfg(not(windows))]
+            {
+                path.starts_with(root)
+            }
         })
     }
     

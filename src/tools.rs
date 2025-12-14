@@ -14,7 +14,7 @@ use crate::crawler::{CrawlOptions, Crawler, DirCheckInput, HashAlgorithm, HashTy
 use crate::mcp::{
     CallToolResult, McpServerHandler, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
 };
-use crate::network::{NetworkService, NodeRef, PeerStatus};
+use crate::network::{NetworkService, NodeRef, PeerStatus, ToolExecutor, ToolResult as NetworkToolResult};
 use crate::operations::{CopyOptions, FileManager, ListOptions, ReadOptions, SortBy, WriteOptions};
 use crate::platform::FileAttributes;
 use crate::security::SecurityPolicy;
@@ -89,6 +89,66 @@ impl UfmServer {
 
     pub fn build(&self) -> &str {
         &self.build
+    }
+
+    /// Get a tool executor that can be used by the network layer
+    pub fn tool_executor(&self) -> Arc<dyn ToolExecutor> {
+        Arc::new(LocalToolExecutor {
+            state: self.state.clone(),
+            version: self.version.clone(),
+            build: self.build.clone(),
+        })
+    }
+}
+
+/// Tool executor for handling remote tool requests
+struct LocalToolExecutor {
+    state: Arc<ToolState>,
+    version: String,
+    build: String,
+}
+
+impl ToolExecutor for LocalToolExecutor {
+    fn execute<'a>(
+        &'a self,
+        tool: &'a str,
+        params: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NetworkToolResult> + Send + 'a>> {
+        Box::pin(async move {
+            let result = match tool {
+                "ufm_status" => handle_status(self.state.clone(), params, &self.version, &self.build).await,
+                "ufm_read" => handle_read_file(self.state.clone(), params).await,
+                "ufm_stat" => handle_stat(self.state.clone(), params).await,
+                "ufm_list" => handle_list(self.state.clone(), params).await,
+                "ufm_exists" => handle_exists(self.state.clone(), params).await,
+                "ufm_search" => handle_search(self.state.clone(), params).await,
+                "ufm_write" => handle_write_file(self.state.clone(), params).await,
+                "ufm_mkdir" => handle_mkdir(self.state.clone(), params).await,
+                "ufm_delete" => handle_delete(self.state.clone(), params).await,
+                "ufm_rename" => handle_rename(self.state.clone(), params).await,
+                "ufm_copy" => handle_copy(self.state.clone(), params).await,
+                "ufm_set_modified" => handle_set_modified(self.state.clone(), params).await,
+                "ufm_set_readonly" => handle_set_readonly(self.state.clone(), params).await,
+                "ufm_set_permissions" => handle_set_permissions(self.state.clone(), params).await,
+                "ufm_batch_set_modified" => handle_batch_set_modified(self.state.clone(), params).await,
+                "ufm_batch_set_readonly" => handle_batch_set_readonly(self.state.clone(), params).await,
+                "ufm_archive_list" => handle_archive_list(self.state.clone(), params).await,
+                "ufm_archive_read" => handle_archive_read(self.state.clone(), params).await,
+                "ufm_archive_extract" => handle_archive_extract(self.state.clone(), params).await,
+                "ufm_archive_create" => handle_archive_create(self.state.clone(), params).await,
+                "ufm_crawl" => handle_crawl(self.state.clone(), params).await,
+                "ufm_dir_check" => handle_dir_check(self.state.clone(), params).await,
+                "ufm_hash_sample" => handle_hash_sample(self.state.clone(), params).await,
+                // Note: Network tools (ufm_nodes, ufm_ping, ufm_discover, ufm_transfer) are not
+                // exposed for remote execution to prevent relay attacks
+                _ => Err(format!("Unknown or disallowed tool: {}", tool)),
+            };
+
+            match result {
+                Ok(content) => NetworkToolResult::Success(content),
+                Err(e) => NetworkToolResult::Error(e),
+            }
+        })
     }
 }
 
@@ -636,7 +696,7 @@ fn batch_set_readonly_tool() -> Tool {
 fn archive_list_tool() -> Tool {
     Tool::new(
         "ufm_archive_list",
-        "List contents of an archive (ZIP, TAR, TAR.GZ). Use internal_path to navigate within the archive.",
+        "List contents of an archive (ZIP, TAR, TAR.GZ). Use internal_path to navigate within the archive. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -647,7 +707,8 @@ fn archive_list_tool() -> Tool {
                 "internal_path": {
                     "type": "string",
                     "description": "Path within the archive (empty for root)"
-                }
+                },
+                "node": node_param_schema()
             },
             "required": ["path"]
         }),
@@ -657,7 +718,7 @@ fn archive_list_tool() -> Tool {
 fn archive_read_tool() -> Tool {
     Tool::new(
         "ufm_archive_read",
-        "Read a file from within an archive without extracting.",
+        "Read a file from within an archive without extracting. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -672,7 +733,8 @@ fn archive_read_tool() -> Tool {
                 "as_base64": {
                     "type": "boolean",
                     "description": "Return content as base64"
-                }
+                },
+                "node": node_param_schema()
             },
             "required": ["path", "internal_path"]
         }),
@@ -682,7 +744,7 @@ fn archive_read_tool() -> Tool {
 fn archive_extract_tool() -> Tool {
     Tool::new(
         "ufm_archive_extract",
-        "Extract a file from an archive to disk.",
+        "Extract a file from an archive to disk. Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -697,7 +759,8 @@ fn archive_extract_tool() -> Tool {
                 "destination": {
                     "type": "string",
                     "description": "Destination path on disk"
-                }
+                },
+                "node": node_param_schema()
             },
             "required": ["archive_path", "internal_path", "destination"]
         }),
@@ -707,7 +770,7 @@ fn archive_extract_tool() -> Tool {
 fn archive_create_tool() -> Tool {
     Tool::new(
         "ufm_archive_create",
-        "Create a new archive from files. Format determined by extension (.zip, .tar, .tar.gz).",
+        "Create a new archive from files. Format determined by extension (.zip, .tar, .tar.gz). Supports remote nodes.",
         json!({
             "type": "object",
             "properties": {
@@ -725,7 +788,8 @@ fn archive_create_tool() -> Tool {
                             "name": { "type": "string" }
                         }
                     }
-                }
+                },
+                "node": node_param_schema()
             },
             "required": ["archive_path", "files"]
         }),
@@ -1001,15 +1065,20 @@ async fn maybe_route_remote(
         return Ok(None); // Handle locally
     }
 
-    // Route to remote peer
-    let result = network.router.route_tool_request(&node_ref, tool_name, args.clone()).await
+    // Route to remote peer - strip the node argument to prevent routing loops
+    let mut remote_args = args.clone();
+    if let Some(obj) = remote_args.as_object_mut() {
+        obj.remove("node");
+    }
+    let result = network.router.route_tool_request(&node_ref, tool_name, remote_args).await
         .map_err(|e| format!("Remote call failed: {}", e))?;
 
     match result {
         Some(tool_result) => {
             match tool_result {
                 crate::network::protocol::ToolResult::Success(data) => {
-                    Ok(Some(data.to_string()))
+                    // data is already a JSON string
+                    Ok(Some(data))
                 }
                 crate::network::protocol::ToolResult::Error(e) => {
                     Err(e)
@@ -1048,6 +1117,13 @@ async fn handle_status(state: Arc<ToolState>, args: Value, version: &str, build:
         })
     };
 
+    // Get user directories so clients know where to put files
+    let home_dir = dirs::home_dir().map(|p| p.to_string_lossy().to_string());
+    let downloads_dir = dirs::download_dir().map(|p| p.to_string_lossy().to_string());
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok();
+
     Ok(json!({
         "status": "ok",
         "name": "UFM",
@@ -1057,6 +1133,9 @@ async fn handle_status(state: Arc<ToolState>, args: Value, version: &str, build:
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "hostname": get_hostname(),
+        "username": username,
+        "home_dir": home_dir,
+        "downloads_dir": downloads_dir,
         "network": network_info,
         "p2p": p2p_status
     })
@@ -1609,6 +1688,11 @@ async fn handle_batch_set_readonly(state: Arc<ToolState>, args: Value) -> ToolRe
 }
 
 async fn handle_archive_list(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_archive_list").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -1623,6 +1707,11 @@ async fn handle_archive_list(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_archive_read(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_archive_read").await? {
+        return Ok(result);
+    }
+
     let path: PathBuf = args["path"]
         .as_str()
         .ok_or("path is required")?
@@ -1648,6 +1737,11 @@ async fn handle_archive_read(state: Arc<ToolState>, args: Value) -> ToolResult {
 }
 
 async fn handle_archive_extract(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_archive_extract").await? {
+        return Ok(result);
+    }
+
     let archive: PathBuf = args["archive_path"]
         .as_str()
         .ok_or("archive_path is required")?
@@ -1675,6 +1769,11 @@ async fn handle_archive_extract(state: Arc<ToolState>, args: Value) -> ToolResul
 }
 
 async fn handle_archive_create(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_archive_create").await? {
+        return Ok(result);
+    }
+
     let archive: PathBuf = args["archive_path"]
         .as_str()
         .ok_or("archive_path is required")?
@@ -2275,43 +2374,34 @@ async fn handle_transfer(state: Arc<ToolState>, args: Value) -> ToolResult {
     // Full P2P relay transfers would need more infrastructure
 
     if source_is_local && !dest_is_local {
-        // Push to remote: read local file and send via ufm_write tool on remote
-        let content = tokio::fs::read(source_path).await
-            .map_err(|e| format!("Failed to read source file: {}", e))?;
+        // Push to remote: stream file directly over P2P connection
+        let peer_uuid = network.peers.resolve_node(&dest_node).await
+            .map_err(|e| format!("Failed to resolve destination node: {}", e))?;
 
-        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &content);
+        let local_path = std::path::PathBuf::from(source_path);
+        let info = network.peers.stream_file_to_peer(
+            peer_uuid,
+            &local_path,
+            dest_path,
+            compression,
+        ).await.map_err(|e| format!("Stream transfer failed: {}", e))?;
 
-        let remote_args = json!({
-            "path": dest_path,
-            "content": encoded,
-            "from_base64": true,
-            "node": args["dest_node"]
-        });
-
-        // Route to remote
-        let result = network.router.route_tool_request(&dest_node, "ufm_write", remote_args).await
-            .map_err(|e| format!("Remote write failed: {}", e))?;
-
-        match result {
-            Some(crate::network::protocol::ToolResult::Success(_)) => {
-                Ok(json!({
-                    "success": true,
-                    "transfer_type": "push",
-                    "bytes_transferred": content.len(),
-                    "source": source_path,
-                    "dest": dest_path,
-                    "compression": format!("{:?}", compression).to_lowercase()
-                }).to_string())
-            }
-            Some(crate::network::protocol::ToolResult::Error(e)) => Err(e),
-            None => Err("Unexpected local routing for remote transfer".to_string()),
-        }
+        Ok(json!({
+            "success": true,
+            "transfer_type": "stream_push",
+            "transfer_id": info.id,
+            "bytes_transferred": info.transferred_bytes,
+            "source": source_path,
+            "dest": dest_path,
+            "compression": format!("{:?}", compression).to_lowercase(),
+            "speed_mbps": info.bytes_per_second() / 1_000_000.0
+        }).to_string())
     } else if !source_is_local && dest_is_local {
         // Pull from remote: use ufm_read tool on remote, then write locally
+        // Note: Do NOT include node in remote_args - we want ufm_read to execute locally on the remote
         let remote_args = json!({
             "path": source_path,
-            "as_base64": true,
-            "node": args["source_node"]
+            "as_base64": true
         });
 
         let result = network.router.route_tool_request(&source_node, "ufm_read", remote_args).await
@@ -2319,12 +2409,9 @@ async fn handle_transfer(state: Arc<ToolState>, args: Value) -> ToolResult {
 
         let content = match result {
             Some(crate::network::protocol::ToolResult::Success(data)) => {
-                // Parse the response - it should be base64 content
-                let response: serde_json::Value = serde_json::from_str(&data.to_string())
-                    .map_err(|_| "Failed to parse remote response")?;
-                let encoded = response["content"].as_str()
-                    .ok_or("Remote response missing content")?;
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                // ufm_read returns the content directly as a string (base64 encoded since we requested as_base64)
+                // The data is already the base64 string, decode it
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data)
                     .map_err(|e| format!("Failed to decode content: {}", e))?
             }
             Some(crate::network::protocol::ToolResult::Error(e)) => return Err(e),
