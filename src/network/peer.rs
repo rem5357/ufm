@@ -507,6 +507,73 @@ impl PeerManager {
                         let _ = tm.abort_incoming(transfer_id, reason).await;
                     }
                 }
+                // Handle pull request - peer wants us to stream a file to them
+                PeerMessage::StreamPullRequest { transfer_id, path, compression } => {
+                    tracing::info!(
+                        "Stream pull request from {}: transfer_id={}, path={}",
+                        peer_identity.name, transfer_id, path
+                    );
+
+                    // Stream the file back to the requester
+                    match Self::handle_stream_pull_request(
+                        &mut writer,
+                        transfer_id,
+                        &path,
+                        compression,
+                        false, // not a directory
+                    ).await {
+                        Ok(bytes) => {
+                            tracing::info!(
+                                "Completed streaming {} bytes for pull request {}",
+                                bytes, transfer_id
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to handle pull request: {}", e);
+                            let abort = PeerMessage::StreamAbort {
+                                transfer_id,
+                                reason: format!("Pull failed: {}", e),
+                            };
+                            if let Ok(data) = abort.encode() {
+                                let _ = writer.write_all(&data).await;
+                                let _ = writer.flush().await;
+                            }
+                        }
+                    }
+                }
+                // Handle directory pull request - stream as tar
+                PeerMessage::StreamPullDirectoryRequest { transfer_id, path, compression } => {
+                    tracing::info!(
+                        "Stream pull directory request from {}: transfer_id={}, path={}",
+                        peer_identity.name, transfer_id, path
+                    );
+
+                    match Self::handle_stream_pull_request(
+                        &mut writer,
+                        transfer_id,
+                        &path,
+                        compression,
+                        true, // is a directory
+                    ).await {
+                        Ok(bytes) => {
+                            tracing::info!(
+                                "Completed streaming {} bytes for directory pull request {}",
+                                bytes, transfer_id
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to handle directory pull request: {}", e);
+                            let abort = PeerMessage::StreamAbort {
+                                transfer_id,
+                                reason: format!("Directory pull failed: {}", e),
+                            };
+                            if let Ok(data) = abort.encode() {
+                                let _ = writer.write_all(&data).await;
+                                let _ = writer.flush().await;
+                            }
+                        }
+                    }
+                }
                 other => {
                     tracing::debug!(
                         "Received unexpected message from {}: {:?}",
@@ -516,6 +583,230 @@ impl PeerManager {
                 }
             }
         }
+    }
+
+    /// Handle a pull request by streaming a file back to the requester
+    async fn handle_stream_pull_request<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        transfer_id: u64,
+        path: &str,
+        compression: Compression,
+        is_directory: bool,
+    ) -> anyhow::Result<u64> {
+        let path = std::path::PathBuf::from(path);
+
+        if is_directory {
+            return Self::handle_directory_stream(writer, transfer_id, &path, compression).await;
+        }
+
+        // Open file and get metadata
+        let metadata = tokio::fs::metadata(&path).await?;
+        if !metadata.is_file() {
+            anyhow::bail!("Path is not a file: {}", path.display());
+        }
+        let file_size = metadata.len();
+
+        // Send StreamStart
+        let start_msg = PeerMessage::StreamStart {
+            transfer_id,
+            path: path.to_string_lossy().to_string(),
+            size: file_size,
+            is_directory: false,
+            compression,
+        };
+        let data = start_msg.encode()?;
+        writer.write_all(&data).await?;
+        writer.flush().await?;
+
+        // Open file for reading
+        let mut file = tokio::fs::File::open(&path).await?;
+
+        // Stream file in chunks
+        let chunk_size = DEFAULT_CHUNK_SIZE;
+        let mut buffer = vec![0u8; chunk_size];
+        let mut sequence = 0u64;
+        let mut total_sent = 0u64;
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let chunk = &buffer[..bytes_read];
+            hasher.update(chunk);
+
+            // Compress if needed
+            let data_bytes = match compression {
+                Compression::None => chunk.to_vec(),
+                Compression::Gzip => {
+                    let mut encoder = flate2::write::GzEncoder::new(
+                        Vec::new(),
+                        flate2::Compression::fast(),
+                    );
+                    std::io::Write::write_all(&mut encoder, chunk)?;
+                    encoder.finish()?
+                }
+                Compression::Zstd => {
+                    zstd::encode_all(std::io::Cursor::new(chunk), 1)?
+                }
+            };
+
+            let data_msg = PeerMessage::StreamData {
+                transfer_id,
+                sequence,
+                data: data_bytes,
+            };
+            let data = data_msg.encode()?;
+            writer.write_all(&data).await?;
+
+            total_sent += bytes_read as u64;
+            sequence += 1;
+
+            // Flush periodically (every 10 chunks)
+            if sequence % 10 == 0 {
+                writer.flush().await?;
+            }
+        }
+
+        // Send StreamEnd with checksum
+        let checksum = format!("{:016x}", hasher.finish());
+        let end_msg = PeerMessage::StreamEnd {
+            transfer_id,
+            checksum: Some(checksum),
+        };
+        let data = end_msg.encode()?;
+        writer.write_all(&data).await?;
+        writer.flush().await?;
+
+        Ok(total_sent)
+    }
+
+    /// Handle directory streaming as a tar archive
+    async fn handle_directory_stream<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        transfer_id: u64,
+        dir_path: &std::path::Path,
+        compression: Compression,
+    ) -> anyhow::Result<u64> {
+        use std::io::Write as StdWrite;
+
+        // Verify it's a directory
+        let metadata = tokio::fs::metadata(dir_path).await?;
+        if !metadata.is_dir() {
+            anyhow::bail!("Path is not a directory: {}", dir_path.display());
+        }
+
+        tracing::info!("Building tar archive for directory: {}", dir_path.display());
+
+        // Build tar archive in memory (for moderate-sized directories)
+        // For very large directories, we'd need true streaming tar
+        let tar_data = tokio::task::spawn_blocking({
+            let dir_path = dir_path.to_path_buf();
+            move || -> anyhow::Result<Vec<u8>> {
+                let mut tar_builder = tar::Builder::new(Vec::new());
+
+                // Walk directory and add entries
+                for entry in walkdir::WalkDir::new(&dir_path)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let path = entry.path();
+                    let relative = path.strip_prefix(&dir_path)?;
+
+                    // Skip the root directory itself
+                    if relative.as_os_str().is_empty() {
+                        continue;
+                    }
+
+                    if entry.file_type().is_file() {
+                        tar_builder.append_path_with_name(path, relative)?;
+                    } else if entry.file_type().is_dir() {
+                        tar_builder.append_dir(relative, path)?;
+                    }
+                    // Skip symlinks for security
+                }
+
+                tar_builder.finish()?;
+                Ok(tar_builder.into_inner()?)
+            }
+        }).await??;
+
+        // Optionally compress the tar data
+        let final_data = match compression {
+            Compression::None => tar_data,
+            Compression::Gzip => {
+                let mut encoder = flate2::write::GzEncoder::new(
+                    Vec::new(),
+                    flate2::Compression::fast(),
+                );
+                encoder.write_all(&tar_data)?;
+                encoder.finish()?
+            }
+            Compression::Zstd => {
+                zstd::encode_all(std::io::Cursor::new(&tar_data), 3)?
+            }
+        };
+
+        let total_size = final_data.len() as u64;
+        tracing::info!(
+            "Directory tar size: {} bytes (compressed: {:?})",
+            total_size, compression
+        );
+
+        // Send StreamStart
+        let start_msg = PeerMessage::StreamStart {
+            transfer_id,
+            path: dir_path.to_string_lossy().to_string(),
+            size: total_size,
+            is_directory: true,
+            compression,
+        };
+        let data = start_msg.encode()?;
+        writer.write_all(&data).await?;
+        writer.flush().await?;
+
+        // Stream the tar data in chunks
+        let chunk_size = DEFAULT_CHUNK_SIZE;
+        let mut offset = 0usize;
+        let mut sequence = 0u64;
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+
+        while offset < final_data.len() {
+            let end = (offset + chunk_size).min(final_data.len());
+            let chunk = &final_data[offset..end];
+            hasher.update(chunk);
+
+            let data_msg = PeerMessage::StreamData {
+                transfer_id,
+                sequence,
+                data: chunk.to_vec(),
+            };
+            let encoded = data_msg.encode()?;
+            writer.write_all(&encoded).await?;
+
+            offset = end;
+            sequence += 1;
+
+            // Flush periodically
+            if sequence % 10 == 0 {
+                writer.flush().await?;
+            }
+        }
+
+        // Send StreamEnd with checksum
+        let checksum = format!("{:016x}", hasher.finish());
+        let end_msg = PeerMessage::StreamEnd {
+            transfer_id,
+            checksum: Some(checksum),
+        };
+        let data = end_msg.encode()?;
+        writer.write_all(&data).await?;
+        writer.flush().await?;
+
+        Ok(total_size)
     }
 
     /// List all known nodes
@@ -1009,4 +1300,350 @@ impl PeerManager {
         })
     }
 
+    /// Pull a file from a remote peer using streaming (pull transfer)
+    /// This requests the file from the remote and streams it locally
+    pub async fn pull_file_from_peer(
+        &self,
+        peer_uuid: Uuid,
+        remote_path: &str,
+        local_path: &std::path::Path,
+        compression: Compression,
+    ) -> anyhow::Result<TransferInfo> {
+        // Ensure connected
+        if !self.is_connected(peer_uuid).await {
+            self.connect(peer_uuid).await?;
+        }
+
+        // Generate transfer ID
+        let transfer_id = self.transfers.next_transfer_id();
+
+        // Create parent directories for local file
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // Get connection
+        let connections = self.connections.read().await;
+        let conn = connections
+            .get(&peer_uuid)
+            .ok_or_else(|| anyhow::anyhow!("Not connected to peer"))?;
+        let mut conn = conn.lock().await;
+
+        // Send StreamPullRequest
+        let pull_request = PeerMessage::StreamPullRequest {
+            transfer_id,
+            path: remote_path.to_string(),
+            compression,
+        };
+        conn.send(&pull_request).await?;
+
+        tracing::info!(
+            "Requesting stream pull {} from peer: {} -> {}",
+            transfer_id, remote_path, local_path.display()
+        );
+
+        let start_time = Instant::now();
+
+        // Receive StreamStart
+        let start_msg = conn.recv().await?;
+        let (file_size, actual_compression) = match start_msg {
+            PeerMessage::StreamStart { transfer_id: tid, size, compression: comp, .. } => {
+                if tid != transfer_id {
+                    anyhow::bail!("Unexpected transfer_id in StreamStart");
+                }
+                (size, comp)
+            }
+            PeerMessage::StreamAbort { reason, .. } => {
+                anyhow::bail!("Pull request rejected: {}", reason);
+            }
+            PeerMessage::Error { message, .. } => {
+                anyhow::bail!("Pull request error: {}", message);
+            }
+            other => {
+                anyhow::bail!("Unexpected response to pull request: {:?}", other);
+            }
+        };
+
+        tracing::debug!("Pull transfer {} started, expecting {} bytes", transfer_id, file_size);
+
+        // Open local file for writing
+        let mut file = tokio::fs::File::create(local_path).await?;
+        let mut total_received = 0u64;
+        let mut expected_sequence = 0u64;
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+
+        // Receive chunks until StreamEnd
+        loop {
+            let msg = conn.recv().await?;
+            match msg {
+                PeerMessage::StreamData { transfer_id: tid, sequence, data } => {
+                    if tid != transfer_id {
+                        continue; // Ignore messages for other transfers
+                    }
+                    if sequence != expected_sequence {
+                        anyhow::bail!(
+                            "Out of sequence chunk: expected {}, got {}",
+                            expected_sequence, sequence
+                        );
+                    }
+
+                    // Decompress if needed
+                    let decompressed = match actual_compression {
+                        Compression::None => data,
+                        Compression::Gzip => {
+                            use std::io::Read;
+                            let mut decoder = flate2::read::GzDecoder::new(&data[..]);
+                            let mut buf = Vec::new();
+                            decoder.read_to_end(&mut buf)?;
+                            buf
+                        }
+                        Compression::Zstd => {
+                            zstd::decode_all(std::io::Cursor::new(&data))?
+                        }
+                    };
+
+                    // Update checksum with decompressed data
+                    hasher.update(&decompressed);
+
+                    // Write to file
+                    file.write_all(&decompressed).await?;
+                    total_received += decompressed.len() as u64;
+                    expected_sequence += 1;
+
+                    // Log progress every MB
+                    if total_received % (1024 * 1024) < DEFAULT_CHUNK_SIZE as u64 {
+                        tracing::debug!(
+                            "Pull transfer {} progress: {} / {} bytes ({:.1}%)",
+                            transfer_id, total_received, file_size,
+                            (total_received as f64 / file_size as f64) * 100.0
+                        );
+                    }
+                }
+                PeerMessage::StreamEnd { transfer_id: tid, checksum } => {
+                    if tid != transfer_id {
+                        continue;
+                    }
+
+                    // Verify checksum if provided
+                    if let Some(expected) = checksum {
+                        let actual = format!("{:016x}", hasher.finish());
+                        if actual != expected {
+                            // Clean up partial file
+                            let _ = tokio::fs::remove_file(local_path).await;
+                            anyhow::bail!(
+                                "Checksum mismatch: expected {}, got {}",
+                                expected, actual
+                            );
+                        }
+                    }
+
+                    // Flush and close file
+                    file.flush().await?;
+                    break;
+                }
+                PeerMessage::StreamAbort { transfer_id: tid, reason } => {
+                    if tid == transfer_id {
+                        // Clean up partial file
+                        let _ = tokio::fs::remove_file(local_path).await;
+                        anyhow::bail!("Transfer aborted: {}", reason);
+                    }
+                }
+                _ => {
+                    // Ignore other messages
+                }
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+        let speed = total_received as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        tracing::info!(
+            "Completed pull transfer {}: {} bytes in {:.2}s ({:.2} MB/s)",
+            transfer_id, total_received, elapsed.as_secs_f64(), speed
+        );
+
+        Ok(TransferInfo {
+            id: transfer_id,
+            source_path: remote_path.to_string(),
+            dest_path: local_path.to_string_lossy().to_string(),
+            peer_uuid,
+            direction: super::transfer::TransferDirection::Incoming,
+            total_bytes: Some(file_size),
+            transferred_bytes: total_received,
+            state: super::transfer::TransferState::Completed,
+            compression: actual_compression,
+            started_at: Some(start_time),
+            completed_at: Some(Instant::now()),
+        })
+    }
+
+    /// Pull a directory from a remote peer using streaming tar
+    pub async fn pull_directory_from_peer(
+        &self,
+        peer_uuid: Uuid,
+        remote_path: &str,
+        local_path: &std::path::Path,
+        compression: Compression,
+    ) -> anyhow::Result<TransferInfo> {
+        use std::io::Read as StdRead;
+
+        // Ensure connected
+        if !self.is_connected(peer_uuid).await {
+            self.connect(peer_uuid).await?;
+        }
+
+        // Generate transfer ID
+        let transfer_id = self.transfers.next_transfer_id();
+
+        // Create destination directory
+        tokio::fs::create_dir_all(local_path).await?;
+
+        // Get connection
+        let connections = self.connections.read().await;
+        let conn = connections
+            .get(&peer_uuid)
+            .ok_or_else(|| anyhow::anyhow!("Not connected to peer"))?;
+        let mut conn = conn.lock().await;
+
+        // Send StreamPullDirectoryRequest
+        let pull_request = PeerMessage::StreamPullDirectoryRequest {
+            transfer_id,
+            path: remote_path.to_string(),
+            compression,
+        };
+        conn.send(&pull_request).await?;
+
+        tracing::info!(
+            "Requesting directory pull {} from peer: {} -> {}",
+            transfer_id, remote_path, local_path.display()
+        );
+
+        let start_time = Instant::now();
+
+        // Receive StreamStart
+        let start_msg = conn.recv().await?;
+        let (file_size, actual_compression, is_dir) = match start_msg {
+            PeerMessage::StreamStart { transfer_id: tid, size, compression: comp, is_directory, .. } => {
+                if tid != transfer_id {
+                    anyhow::bail!("Unexpected transfer_id in StreamStart");
+                }
+                if !is_directory {
+                    anyhow::bail!("Expected directory stream but got file stream");
+                }
+                (size, comp, is_directory)
+            }
+            PeerMessage::StreamAbort { reason, .. } => {
+                anyhow::bail!("Pull request rejected: {}", reason);
+            }
+            PeerMessage::Error { message, .. } => {
+                anyhow::bail!("Pull request error: {}", message);
+            }
+            other => {
+                anyhow::bail!("Unexpected response to pull request: {:?}", other);
+            }
+        };
+
+        tracing::debug!(
+            "Directory pull transfer {} started, expecting {} bytes (is_dir: {})",
+            transfer_id, file_size, is_dir
+        );
+
+        // Collect all tar data (we need the complete stream to extract)
+        let mut tar_data = Vec::with_capacity(file_size as usize);
+        let mut expected_sequence = 0u64;
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+
+        // Receive chunks until StreamEnd
+        loop {
+            let msg = conn.recv().await?;
+            match msg {
+                PeerMessage::StreamData { transfer_id: tid, sequence, data } => {
+                    if tid != transfer_id {
+                        continue;
+                    }
+                    if sequence != expected_sequence {
+                        anyhow::bail!(
+                            "Out of sequence chunk: expected {}, got {}",
+                            expected_sequence, sequence
+                        );
+                    }
+
+                    // Data is already in final form (tar, possibly compressed)
+                    hasher.update(&data);
+                    tar_data.extend_from_slice(&data);
+                    expected_sequence += 1;
+                }
+                PeerMessage::StreamEnd { transfer_id: tid, checksum } => {
+                    if tid != transfer_id {
+                        continue;
+                    }
+
+                    // Verify checksum if provided
+                    if let Some(expected) = checksum {
+                        let actual = format!("{:016x}", hasher.finish());
+                        if actual != expected {
+                            anyhow::bail!(
+                                "Checksum mismatch: expected {}, got {}",
+                                expected, actual
+                            );
+                        }
+                    }
+                    break;
+                }
+                PeerMessage::StreamAbort { transfer_id: tid, reason } => {
+                    if tid == transfer_id {
+                        anyhow::bail!("Transfer aborted: {}", reason);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let total_received = tar_data.len() as u64;
+        tracing::debug!("Received {} bytes of tar data, extracting...", total_received);
+
+        // Decompress if needed
+        let decompressed = match actual_compression {
+            Compression::None => tar_data,
+            Compression::Gzip => {
+                let mut decoder = flate2::read::GzDecoder::new(&tar_data[..]);
+                let mut buf = Vec::new();
+                decoder.read_to_end(&mut buf)?;
+                buf
+            }
+            Compression::Zstd => {
+                zstd::decode_all(std::io::Cursor::new(&tar_data))?
+            }
+        };
+
+        // Extract tar archive
+        let local_path_owned = local_path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut archive = tar::Archive::new(&decompressed[..]);
+            archive.unpack(&local_path_owned)?;
+            Ok(())
+        }).await??;
+
+        let elapsed = start_time.elapsed();
+        let speed = total_received as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        tracing::info!(
+            "Completed directory pull transfer {}: {} bytes in {:.2}s ({:.2} MB/s)",
+            transfer_id, total_received, elapsed.as_secs_f64(), speed
+        );
+
+        Ok(TransferInfo {
+            id: transfer_id,
+            source_path: remote_path.to_string(),
+            dest_path: local_path.to_string_lossy().to_string(),
+            peer_uuid,
+            direction: super::transfer::TransferDirection::Incoming,
+            total_bytes: Some(file_size),
+            transferred_bytes: total_received,
+            state: super::transfer::TransferState::Completed,
+            compression: actual_compression,
+            started_at: Some(start_time),
+            completed_at: Some(Instant::now()),
+        })
+    }
 }

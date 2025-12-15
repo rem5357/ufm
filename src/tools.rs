@@ -966,18 +966,18 @@ fn discover_tool() -> Tool {
 fn transfer_tool() -> Tool {
     Tool::new(
         "ufm_transfer",
-        "Transfer a file between nodes using streaming. Returns a transfer ID for tracking progress.",
+        "Transfer a file or directory between nodes using streaming. For directories, use recursive=true to transfer as a compressed tar archive.",
         json!({
             "type": "object",
             "properties": {
                 "source_path": {
                     "type": "string",
-                    "description": "Path to the source file"
+                    "description": "Path to the source file or directory"
                 },
                 "source_node": node_param_schema(),
                 "dest_path": {
                     "type": "string",
-                    "description": "Path to write the file on the destination"
+                    "description": "Path to write the file/directory on the destination"
                 },
                 "dest_node": node_param_schema(),
                 "compression": {
@@ -985,6 +985,11 @@ fn transfer_tool() -> Tool {
                     "enum": ["none", "gzip", "zstd"],
                     "default": "zstd",
                     "description": "Compression method for transfer"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Set to true to transfer a directory recursively (as tar archive)"
                 }
             },
             "required": ["source_path", "dest_path"]
@@ -2339,6 +2344,9 @@ async fn handle_transfer(state: Arc<ToolState>, args: Value) -> ToolResult {
         Some(other) => return Err(format!("Unknown compression: {}", other)),
     };
 
+    // Check if this is a recursive directory transfer
+    let recursive = args["recursive"].as_bool().unwrap_or(false);
+
     // Check if this is a local-to-local transfer (just use regular copy)
     let source_is_local = matches!(source_node, NodeRef::Local);
     let dest_is_local = matches!(dest_node, NodeRef::Local);
@@ -2397,43 +2405,39 @@ async fn handle_transfer(state: Arc<ToolState>, args: Value) -> ToolResult {
             "speed_mbps": info.bytes_per_second() / 1_000_000.0
         }).to_string())
     } else if !source_is_local && dest_is_local {
-        // Pull from remote: use ufm_read tool on remote, then write locally
-        // Note: Do NOT include node in remote_args - we want ufm_read to execute locally on the remote
-        let remote_args = json!({
-            "path": source_path,
-            "as_base64": true
-        });
+        // Pull from remote: use streaming transfer
+        let peer_uuid = network.peers.resolve_node(&source_node).await
+            .map_err(|e| format!("Failed to resolve source node: {}", e))?;
 
-        let result = network.router.route_tool_request(&source_node, "ufm_read", remote_args).await
-            .map_err(|e| format!("Remote read failed: {}", e))?;
+        let local_path = std::path::PathBuf::from(dest_path);
 
-        let content = match result {
-            Some(crate::network::protocol::ToolResult::Success(data)) => {
-                // ufm_read returns the content directly as a string (base64 encoded since we requested as_base64)
-                // The data is already the base64 string, decode it
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data)
-                    .map_err(|e| format!("Failed to decode content: {}", e))?
-            }
-            Some(crate::network::protocol::ToolResult::Error(e)) => return Err(e),
-            None => return Err("Unexpected local routing for remote transfer".to_string()),
+        let info = if recursive {
+            // Directory transfer using tar streaming
+            network.peers.pull_directory_from_peer(
+                peer_uuid,
+                source_path,
+                &local_path,
+                compression,
+            ).await.map_err(|e| format!("Directory pull transfer failed: {}", e))?
+        } else {
+            // File transfer
+            network.peers.pull_file_from_peer(
+                peer_uuid,
+                source_path,
+                &local_path,
+                compression,
+            ).await.map_err(|e| format!("Stream pull transfer failed: {}", e))?
         };
-
-        // Write locally
-        let dest = PathBuf::from(dest_path);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await
-                .map_err(|e| format!("Failed to create parent directories: {}", e))?;
-        }
-        tokio::fs::write(&dest, &content).await
-            .map_err(|e| format!("Failed to write destination file: {}", e))?;
 
         Ok(json!({
             "success": true,
-            "transfer_type": "pull",
-            "bytes_transferred": content.len(),
+            "transfer_type": if recursive { "stream_pull_directory" } else { "stream_pull" },
+            "transfer_id": info.id,
+            "bytes_transferred": info.transferred_bytes,
             "source": source_path,
             "dest": dest_path,
-            "compression": format!("{:?}", compression).to_lowercase()
+            "compression": format!("{:?}", compression).to_lowercase(),
+            "speed_mbps": info.bytes_per_second() / 1_000_000.0
         }).to_string())
     } else {
         // Remote-to-remote transfer - would need relay or direct P2P

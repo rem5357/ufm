@@ -17,9 +17,9 @@
 ## Project Status
 
 **Version**: 0.50.0
-**Build**: 139
+**Build**: 145
 **Status**: Active Development
-**Last Updated**: 2025-12-14
+**Last Updated**: 2025-12-15
 
 ### Current Nodes
 - **Goldshire** (Linux): 192.168.86.112:9847 - Home server daemon
@@ -28,6 +28,42 @@
 ---
 
 ## Development History
+
+### Session 7: Streaming Transfers (2025-12-15)
+
+#### Summary
+Implemented streaming pull transfers for files and directories. Eliminates base64 memory bloat - large files now stream in 64KB chunks with constant memory usage.
+
+#### What Was Accomplished
+
+1. **Streaming File Pull**
+   - New `StreamPullRequest` message type
+   - Remote streams file via `StreamStart` → `StreamData` chunks → `StreamEnd`
+   - Client receives and writes chunks directly to disk
+   - Memory usage: ~64KB constant (vs 1.33x file size for base64)
+
+2. **Directory Streaming with Tar**
+   - New `StreamPullDirectoryRequest` message type
+   - Remote builds tar archive, compresses with zstd, streams chunks
+   - Client receives tar, decompresses, extracts to destination
+   - `ufm_transfer` now accepts `recursive: true` for directories
+
+3. **Protocol Changes**
+   - Added `StreamPullRequest { transfer_id, path, compression }`
+   - Added `StreamPullDirectoryRequest { transfer_id, path, compression }`
+
+4. **New PeerManager Methods**
+   - `pull_file_from_peer()` - streaming file download
+   - `pull_directory_from_peer()` - streaming directory download as tar
+
+#### Test Results
+- File pull: 278 MB (Songs1.zip) streamed successfully
+- Directory pull: 321 MB (Songs1 folder) as compressed tar, extracted on Falcon
+
+#### Build History
+- Build 145: Streaming pull transfers for files and directories
+
+---
 
 ### Session 6: Service Management & CLI Commands (2025-12-14, continued)
 
@@ -280,7 +316,7 @@ ufm --status           # Show service status (Linux)
 ## Outstanding TODOs
 
 ### High Priority
-- [ ] **Pull transfers still use base64**: Should implement streaming pull like push
+- [x] **Pull transfers still use base64**: ~~Should implement streaming pull like push~~ DONE (build 145) - streaming pull for files and directories
 
 ### Medium Priority
 - [ ] **Remote-to-remote transfers**: Currently returns "not yet implemented"

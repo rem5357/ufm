@@ -66,6 +66,20 @@ pub enum PeerMessage {
     },
 
     // ==================== Streaming Transfers ====================
+    /// Request to pull a file from the remote peer (initiates streaming)
+    StreamPullRequest {
+        transfer_id: u64,
+        path: String,
+        compression: Compression,
+    },
+
+    /// Request to pull a directory from the remote peer (tar stream)
+    StreamPullDirectoryRequest {
+        transfer_id: u64,
+        path: String,
+        compression: Compression,
+    },
+
     /// Start a streaming transfer
     StreamStart {
         transfer_id: u64,
@@ -222,7 +236,9 @@ impl PeerMessage {
             PeerMessage::ToolRequest { .. } => MessageType::ToolRequest,
             PeerMessage::ToolResponse { .. } => MessageType::ToolResponse,
 
-            PeerMessage::StreamStart { .. }
+            PeerMessage::StreamPullRequest { .. }
+            | PeerMessage::StreamPullDirectoryRequest { .. }
+            | PeerMessage::StreamStart { .. }
             | PeerMessage::StreamEnd { .. }
             | PeerMessage::StreamAck { .. }
             | PeerMessage::StreamAbort { .. }
