@@ -81,6 +81,18 @@ struct Args {
     /// Use this on headless servers that don't run Claude Desktop
     #[arg(long)]
     daemon: bool,
+
+    /// Restart the UFM systemd service (Linux only)
+    #[arg(long)]
+    restart: bool,
+
+    /// Stop the UFM systemd service (Linux only)
+    #[arg(long)]
+    stop: bool,
+
+    /// Show status of the UFM systemd service (Linux only)
+    #[arg(long)]
+    status: bool,
 }
 
 /// Configuration for UFM
@@ -253,6 +265,60 @@ impl Config {
     }
 }
 
+/// Handle systemd service control commands (Linux only)
+#[cfg(target_os = "linux")]
+fn handle_service_command(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let service_name = "ufm";
+
+    if args.status {
+        // Show service status
+        let status = Command::new("systemctl")
+            .args(["status", service_name, "--no-pager"])
+            .status()?;
+
+        if !status.success() {
+            // systemctl status returns non-zero if service isn't running, which is fine
+        }
+        return Ok(());
+    }
+
+    if args.stop {
+        println!("Stopping UFM service...");
+        let status = Command::new("sudo")
+            .args(["systemctl", "stop", service_name])
+            .status()?;
+
+        if status.success() {
+            println!("UFM service stopped.");
+        } else {
+            eprintln!("Failed to stop UFM service. Try running with sudo.");
+        }
+        return Ok(());
+    }
+
+    if args.restart {
+        println!("Restarting UFM service...");
+        let status = Command::new("sudo")
+            .args(["systemctl", "restart", service_name])
+            .status()?;
+
+        if status.success() {
+            println!("UFM service restarted.");
+            // Show brief status
+            let _ = Command::new("systemctl")
+                .args(["status", service_name, "--no-pager", "-n", "5"])
+                .status();
+        } else {
+            eprintln!("Failed to restart UFM service. Try running with sudo.");
+        }
+        return Ok(());
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -320,6 +386,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         return Ok(());
+    }
+
+    // Handle service control commands (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        if args.restart || args.stop || args.status {
+            return handle_service_command(&args);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if args.restart || args.stop || args.status {
+            eprintln!("Service commands (--restart, --stop, --status) are only available on Linux.");
+            return Ok(());
+        }
     }
 
     // Load configuration

@@ -1,0 +1,36 @@
+[Unit]
+Description=UFM - Universal File Manager (P2P Daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mithroll
+ExecStart=/home/mithroll/.local/bin/ufm --network --daemon --node-name goldshire
+
+# Crash recovery - restart on failure with backoff
+Restart=on-failure
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
+
+# Prevent rapid restart loops (max 5 restarts in 60 seconds)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Environment
+Environment=RUST_BACKTRACE=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ufm
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/mithroll
+
+[Install]
+WantedBy=multi-user.target

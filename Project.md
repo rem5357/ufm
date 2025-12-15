@@ -1,105 +1,361 @@
-# UFM Project Status
+# UFM Project Documentation
 
-## Session: 2025-12-13 - P2P Networking & Transfer Debugging
+## Project Overview
 
-### Summary
-Debugged and fixed multiple issues with P2P networking between UFM nodes (Falcon on Windows, Goldshire on Linux). Successfully implemented remote archive creation and improved transfer functionality.
+**UFM (Universal File Manager)** is a cross-platform MCP (Model Context Protocol) server that provides comprehensive file management capabilities to Claude Desktop and other MCP clients. It enables AI assistants to safely interact with the filesystem through a sandboxed, permission-controlled interface.
 
-### Nodes
-- **Goldshire** (Linux): 192.168.86.112:9847 - Acts as bootstrap node and daemon
+### Core Value Proposition
+
+- **Single Binary**: Zero runtime dependencies - just download and run
+- **Cross-Platform**: Native support for Windows, Linux, and macOS
+- **Security First**: Comprehensive sandboxing with configurable access controls
+- **MCP Native**: Purpose-built for the Model Context Protocol
+- **P2P Networking**: Seamless file operations across machines via zero-config mDNS discovery
+- **Archive Support**: Navigate ZIP/TAR files as virtual filesystems
+- **Auto-Update**: Self-updating with crash recovery and systemd integration
+
+## Project Status
+
+**Version**: 0.50.0
+**Build**: 139
+**Status**: Active Development
+**Last Updated**: 2025-12-14
+
+### Current Nodes
+- **Goldshire** (Linux): 192.168.86.112:9847 - Home server daemon
 - **Falcon** (Windows): Claude Desktop MCP client
 
-### What Was Accomplished
+---
 
-#### 1. Remote Archive Creation (Build 106)
-- Added `node` parameter to all archive tools:
-  - `ufm_archive_create`
-  - `ufm_archive_list`
-  - `ufm_archive_read`
-  - `ufm_archive_extract`
-- Added `maybe_route_remote()` calls to archive handlers
-- **Result**: Can now create zip files on remote nodes via MCP tools
+## Development History
 
-#### 2. Transfer Pull Fix (Build 109)
-- **Bug**: Pull transfers (`source_node: 1, dest_node: 0`) returned "Node not found: id 1"
-- **Cause**: `handle_transfer` was including `"node": args["source_node"]` in remote_args, causing the remote to try routing to a non-existent node
-- **Fix**: Removed node parameter from remote_args - we want `ufm_read` to execute locally on the remote
-- Also fixed response parsing - `ufm_read` returns content directly, not a JSON object
+### Session 6: Service Management & CLI Commands (2025-12-14, continued)
 
-#### 3. Security Path Normalization (Build 112)
-- **Bug**: Paths like `C:\Users\rober\Downloads` were rejected as "outside allowed roots" even when home dir was allowed
-- **Cause**: `allowed_roots` weren't normalized, and `path.starts_with(root)` comparison failed due to different path formats
-- **Fix**:
-  - Added `normalize_root()` to canonicalize allowed roots when stored
-  - Made `is_within_allowed_roots()` case-insensitive on Windows
+#### What Was Accomplished
 
-#### 4. Status Endpoint Improvements (Build 115)
-- **Problem**: Claude Desktop guessed wrong username ("mithroll" instead of "rober") when constructing paths
-- **Fix**: Added to `ufm_status` response:
-  - `username` - current logged-in user
-  - `home_dir` - full path to home directory
-  - `downloads_dir` - full path to Downloads folder
-- Now clients can query these instead of guessing
+1. **Systemd Service Improvements**
+   - Enhanced crash recovery with `Restart=on-failure` and backoff (5s to 60s)
+   - Added `StartLimitIntervalSec=60` and `StartLimitBurst=5` to prevent rapid restart loops
+   - Security hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`
 
-### Lessons Learned
+2. **New CLI Commands**
+   - `ufm --restart` - Restart the UFM systemd service
+   - `ufm --stop` - Stop the UFM systemd service
+   - `ufm --status` - Show service status
+   - Works from anywhere (uses systemctl)
 
-1. **Node parameter stripping**: When routing tool requests to remote nodes, the `node` parameter must be stripped from args to prevent routing loops. The remote executes the tool locally.
+#### Build History
+- Build 139: Service management CLI commands
 
-2. **Path normalization is critical**: On Windows, paths must be:
-   - Canonicalized for consistent comparison
-   - Compared case-insensitively
-   - Both the checked path AND the allowed roots must be normalized
+---
 
-3. **Don't assume usernames**: MCP clients shouldn't hardcode or guess usernames. Expose paths via status/info endpoints.
+### Session 5: mDNS Zero-Config Discovery (2025-12-14)
 
-4. **Bincode + serde_json::Value don't mix**: Earlier in the session (pre-summary), discovered bincode can't serialize `serde_json::Value`. Solution was to use `params_json: String` and serialize JSON separately.
+#### Summary
+Implemented full zero-config peer discovery via mDNS/DNS-SD on both Linux and Windows. Bootstrap nodes are now optional - UFM nodes automatically discover each other on the local network.
 
-5. **Session handling matters**: Peer connections need to stay open and handle multiple messages, not just accept and close.
+#### What Was Accomplished
 
-### Outstanding Problems / TODOs
+1. **Linux mDNS Registration Fix (Build 126)**
+   - **Bug**: UFM logged "mDNS service registered" but service wasn't visible via `avahi-browse`
+   - **Root Cause**: The `mdns_sd` crate creates its own mDNS socket which conflicts with avahi-daemon (already bound to UDP port 5353)
+   - **Fix**: On Linux, spawn `avahi-publish` subprocess for service registration
+     - Added `#[cfg(target_os = "linux")] avahi_process: Option<std::process::Child>` field
+     - Fallback to mdns_sd if avahi-publish not available
+     - Keep mdns_sd for browsing
 
-#### High Priority
-- [ ] **Pull transfers still use base64**: Pull operations (`!source_is_local && dest_is_local`) use `ufm_read` with base64 encoding through tool responses. Should implement streaming pull like we have for push.
-- [x] **Test the full transfer flow**: ~~With build 115, Falcon needs to update and retry the transfer to verify everything works end-to-end.~~ DONE - 67KB transfer successful.
-- [ ] **Eliminate bootstrap nodes**: Make node detection completely dynamic. No hardcoded bootstrap addresses - nodes should discover each other automatically via mDNS or other zero-config methods.
+2. **Windows mDNS Registration (Build 131)**
+   - Uses `dns-sd -R` (Bonjour) for service registration
+   - Added `#[cfg(target_os = "windows")] dnssd_process: Option<std::process::Child>`
+   - Uses `CREATE_NO_WINDOW` flag (0x08000000) to prevent console popups
 
-#### Medium Priority
-- [ ] **Remote-to-remote transfers**: Currently returns "not yet implemented". Would need relay or direct P2P negotiation.
-- [ ] **Transfer progress/status**: `handle_transfer_status` is a placeholder. Need to expose `TransferManager` in `ToolState` for real tracking.
-- [ ] **Security config UX**: Users have to manually edit config.toml to add allowed paths like `D:\`. Consider a tool or flag to add paths.
+3. **Windows mDNS Browsing (Build 133)**
+   - **Problem**: mdns_sd crate couldn't browse when Bonjour service is running
+   - **Fix**: Implemented native dns-sd browsing:
+     - `discover_dnssd_browse()` - spawns `dns-sd -B _ufm._tcp local` to find services
+     - `lookup_dnssd_service()` - spawns `dns-sd -L <name> _ufm._tcp local` to get details
+     - Parses hostname, port, TXT records (uuid, version, os)
+     - Resolves hostname to IP addresses using `ToSocketAddrs`
 
-#### Low Priority
-- [ ] Clean up unused code warnings (67 warnings in build)
-- [ ] The `TransferManager` methods (`start_outgoing`, `get_next_chunk`, etc.) are implemented but never used - the streaming uses direct `stream_file_to_peer` instead
+4. **Config Updates (Build 134)**
+   - Bootstrap nodes now documented as optional
+   - `NetworkConfig::desktop()` and `laptop()` take `Option<SocketAddr>` instead of requiring bootstrap
 
-### Key Files Modified
+#### Lessons Learned
 
-- `src/tools.rs` - Archive tool definitions, transfer handlers, status endpoint
-- `src/security.rs` - Path normalization and Windows case-insensitivity
-- `src/network/peer.rs` - Session handling, streaming transfers (earlier session)
-- `src/network/protocol.rs` - Changed to `params_json: String` (earlier session)
+1. **Native mDNS Services Conflict with Rust Crates**
+   - Both avahi-daemon (Linux) and Bonjour (Windows) bind to UDP port 5353
+   - Rust crates like `mdns_sd` create their own sockets, causing conflicts
+   - Solution: Use native tools (`avahi-publish`, `dns-sd`) via subprocess for registration
+   - Browsing can sometimes work with the crate, but native tools are more reliable
 
-### Build History (This Session)
+2. **Platform-Specific Compilation**
+   - Use `#[cfg(target_os = "linux")]` and `#[cfg(target_os = "windows")]` for platform code
+   - Windows process creation needs `CREATE_NO_WINDOW` flag to avoid popup windows
+   - Use `tokio::task::spawn_blocking` for synchronous DNS operations in async context
+
+3. **dns-sd Command Output Parsing**
+   - Browse format: `"Timestamp A/R Flags if Domain Service_Type Instance_Name"`
+   - Lookup format: Multi-line with hostname info and TXT records
+   - Must handle `.local` suffix in hostnames
+
+#### Build History
+- Build 118: Added mDNS debug logging
+- Build 126: avahi-publish integration for Linux
+- Build 131: Windows dns-sd registration
+- Build 133: Windows dns-sd browsing
+- Build 134: Config cleanup, bootstrap now optional
+
+---
+
+### Session 4: P2P Networking & Transfer Debugging (2025-12-13)
+
+#### Summary
+Debugged and fixed multiple issues with P2P networking between UFM nodes. Successfully implemented remote archive creation and improved transfer functionality.
+
+#### What Was Accomplished
+
+1. **Remote Archive Creation (Build 106)**
+   - Added `node` parameter to all archive tools
+   - Added `maybe_route_remote()` calls to archive handlers
+   - Can now create zip files on remote nodes via MCP tools
+
+2. **Transfer Pull Fix (Build 109)**
+   - **Bug**: Pull transfers returned "Node not found: id 1"
+   - **Cause**: `handle_transfer` was including `"node": args["source_node"]` in remote_args
+   - **Fix**: Removed node parameter from remote_args
+
+3. **Security Path Normalization (Build 112)**
+   - **Bug**: Windows paths rejected as "outside allowed roots" due to format differences
+   - **Fix**: Added `normalize_root()` and case-insensitive comparison on Windows
+
+4. **Status Endpoint Improvements (Build 115)**
+   - Added `username`, `home_dir`, `downloads_dir` to `ufm_status` response
+   - Clients can query paths instead of guessing
+
+#### Lessons Learned
+
+1. **Node parameter stripping**: When routing to remote nodes, strip the `node` parameter to prevent routing loops
+2. **Path normalization is critical**: Both checked path AND allowed roots must be normalized
+3. **Don't assume usernames**: Expose paths via status/info endpoints
+4. **Bincode + serde_json::Value don't mix**: Use `params_json: String` and serialize JSON separately
+
+#### Build History
 - Build 106: Remote archive tools with node parameter
 - Build 109: Transfer pull node routing fix
 - Build 112: Security path normalization
 - Build 115: Status endpoint with username/home_dir/downloads_dir
 
-### Testing Notes
+---
 
-The test file `Faulty.zip` was successfully created on Goldshire at:
+### Session 3: P2P Networking and Auto-Update System (2025-12-12)
+
+#### Major Features Implemented
+
+1. **P2P Networking Infrastructure**
+   - mDNS service discovery for local network peer detection
+   - Node identity system with UUID and human-readable names
+   - Peer connection management with handshake protocol
+   - Binary message protocol with compression support (gzip, zstd)
+   - Transfer manager for file streaming between nodes
+
+2. **Auto-Update System**
+   - Automatic update checking on startup
+   - Periodic background update checks (hourly check, daily download)
+   - Platform-specific binary downloads (Windows `.exe`, Linux binary)
+   - SHA256 checksum verification before applying updates
+   - Atomic binary replacement with backup creation
+
+3. **Daemon Mode**
+   - `--daemon` flag for headless server operation
+   - Runs P2P network only (no MCP server)
+   - Auto-applies updates and restarts via systemd
+
+#### Critical Problems Solved
+
+1. **exec() Runs Old Binary from Memory Cache**
+   - Linux caches running executables in memory even after file replacement
+   - Solution: Exit and let systemd restart the service
+
+2. **Infinite Update Loop**
+   - Build number is compiled into binary; replaced binary reports old build number
+   - Solution: Checksum-based update detection instead of build number comparison
+
+#### Lessons Learned
+
+1. **Linux Executable Memory Caching**: Cannot use `exec()` to reload replaced binary - must fully exit
+2. **Build Numbers vs Checksums**: Checksums are authoritative for update detection
+3. **systemd Integration**: `Restart=always` with `RestartSec=N` is ideal for self-updating daemons
+
+---
+
+### Session 2: Crawl Reliability and Performance (2025-12-11)
+
+#### Problems Solved
+
+1. **Claude Desktop Lock-ups During Crawl**
+   - Caused by "Exceeded max compactions per block" error
+   - Solution: Use smaller batch sizes or dedicated Rust clients
+
+2. **Position-Based Resume Token Fragility**
+   - Solution: Path-based resume tokens with validation
+
+3. **Synchronous I/O Blocking Async Runtime**
+   - Solution: Async I/O for MCP server, `spawn_blocking` for crawl operations
+
+---
+
+### Session 1: Initial Setup and Build Issues (2025-12-09 - 2025-12-10)
+
+- Initial project setup
+- Build system configuration with BUILD file for version tracking
+- Added crawler tools: `ufm_crawl`, `ufm_dir_check`, `ufm_hash`
+
+---
+
+## Architecture
+
+### Module Structure
+
 ```
-/home/mithroll/Projects/Faulty/Faulty.zip
+src/
+├── main.rs          - CLI entry point, config loading, server initialization
+├── lib.rs           - Library exports
+├── mcp.rs           - MCP protocol implementation (async JSON-RPC over stdio)
+├── tools.rs         - MCP tool definitions and handlers
+├── operations.rs    - Core file operations (read, write, delete, etc.)
+├── security.rs      - Path sandboxing and access control
+├── platform.rs      - OS-specific functionality (permissions, xattrs, etc.)
+├── archive.rs       - ZIP/TAR archive handling
+├── crawler.rs       - Directory crawling with batching and resume support
+├── update.rs        - Auto-update system
+└── network/
+    ├── mod.rs       - Network module exports
+    ├── config.rs    - Network configuration
+    ├── discovery.rs - mDNS/DNS-SD peer discovery
+    ├── identity.rs  - Node identity management
+    ├── peer.rs      - Peer connection management
+    ├── protocol.rs  - Binary message protocol
+    ├── router.rs    - Request routing
+    └── transfer.rs  - File transfer management
 ```
 
-Contains 11 files (8 .md, 3 .txt) from the Faulty project root.
+### Key Design Decisions
 
-To test transfer on Falcon after updating to build 115:
+1. **Direct MCP Implementation** - Full control over protocol, async I/O with tokio
+2. **Platform-Native mDNS** - Use OS tools (avahi-publish, dns-sd) instead of pure Rust for reliability
+3. **Checksum-Based Updates** - More reliable than build number comparison
+4. **Security Model** - Multi-layered: sandboxing + pattern blocking + operation controls
+
+---
+
+## Current Features
+
+### Implemented Tools
+
+- **Read Operations**: `ufm_read`, `ufm_stat`, `ufm_list`, `ufm_exists`, `ufm_search`
+- **Write Operations**: `ufm_write`, `ufm_mkdir`, `ufm_delete`, `ufm_rename`, `ufm_copy`
+- **Metadata Operations**: `ufm_set_modified`, `ufm_set_readonly`, `ufm_set_permissions`
+- **Archive Operations**: `ufm_archive_list`, `ufm_archive_read`, `ufm_archive_extract`, `ufm_archive_create`
+- **Crawler Operations**: `ufm_crawl`, `ufm_dir_check`, `ufm_hash`
+- **Network Operations**: `ufm_status`, `ufm_discover`, `ufm_transfer`
+
+### CLI Commands
+
+```bash
+ufm                    # Start MCP server (default)
+ufm --daemon           # Run as P2P daemon only
+ufm --network          # Enable P2P networking
+ufm --config path.toml # Use custom config
+ufm --init             # Generate default config
+ufm --check-update     # Check for updates
+ufm --update           # Download and apply update
+ufm --restart          # Restart systemd service (Linux)
+ufm --stop             # Stop systemd service (Linux)
+ufm --status           # Show service status (Linux)
 ```
-ufm_status  # Check downloads_dir
-ufm_transfer(
-  source_path="/home/mithroll/Projects/Faulty/Faulty.zip",
-  source_node="goldshire",
-  dest_path="<downloads_dir from status>/Faulty.zip"
-)
+
+---
+
+## Outstanding TODOs
+
+### High Priority
+- [ ] **Pull transfers still use base64**: Should implement streaming pull like push
+
+### Medium Priority
+- [ ] **Remote-to-remote transfers**: Currently returns "not yet implemented"
+- [ ] **Transfer progress/status**: `handle_transfer_status` is a placeholder
+- [ ] **Security config UX**: Users must manually edit config.toml to add paths
+
+### Low Priority
+- [ ] Clean up unused code warnings (67 warnings in build)
+- [ ] `TransferManager` methods are implemented but unused (streaming uses `stream_file_to_peer` directly)
+- [ ] Test auto-update on Windows (helper script approach)
+
+---
+
+## Configuration
+
+### Config File Locations
+
+1. `./ufm.toml` (current directory)
+2. `~/.config/ufm/config.toml`
+3. Custom path via `--config` flag
+
+### Example Configuration
+
+```toml
+name = "UFM"
+version = "0.50.0"
+
+[security]
+allowed_roots = []  # Empty = user's home directory
+denied_paths = []
+denied_patterns = ["**/.git/*", "**/node_modules/*"]
+allow_writes = true
+allow_deletes = true
+
+[network]
+bootstrap_nodes = []  # Optional - mDNS provides zero-config discovery
+
+[logging]
+level = "info"
 ```
+
+---
+
+## Deployment
+
+### Update Server Structure
+
+The update server (`http://goldshire:8080/ufm/`) hosts:
+- `version.json` - Version metadata with checksums
+- `ufm.exe` - Windows binary
+- `ufm-linux-x86_64` - Linux binary
+
+### Build and Deploy
+
+```bash
+./dist/build-release.sh  # Build both platforms, update checksums
+cp dist/release/* /var/www/ufm/  # Deploy to web server
+```
+
+### Systemd Service
+
+```bash
+sudo cp dist/ufm.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable ufm
+sudo systemctl start ufm
+```
+
+---
+
+## License
+
+MIT License - See LICENSE file for details
+
+---
+
+**Maintainer**: Robert
+**Repository**: https://github.com/rem5357/ufm

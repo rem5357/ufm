@@ -83,28 +83,28 @@ impl NetworkConfig {
         }
     }
 
-    /// Configuration for a desktop PC
-    pub fn desktop(bootstrap_addr: SocketAddr) -> Self {
+    /// Configuration for a desktop PC (mDNS zero-config, optional bootstrap)
+    pub fn desktop(bootstrap_addr: Option<SocketAddr>) -> Self {
         Self {
             enabled: true,
             listen_port: 9847,
             discovery: DiscoveryConfig {
                 mdns_enabled: true,
-                bootstrap_nodes: vec![bootstrap_addr],
+                bootstrap_nodes: bootstrap_addr.into_iter().collect(),
                 ..Default::default()
             },
             ..Default::default()
         }
     }
 
-    /// Configuration for a laptop (more aggressive discovery)
-    pub fn laptop(bootstrap_addr: SocketAddr) -> Self {
+    /// Configuration for a laptop (more aggressive discovery, mDNS zero-config)
+    pub fn laptop(bootstrap_addr: Option<SocketAddr>) -> Self {
         Self {
             enabled: true,
             listen_port: 9847,
             discovery: DiscoveryConfig {
                 mdns_enabled: true,
-                bootstrap_nodes: vec![bootstrap_addr],
+                bootstrap_nodes: bootstrap_addr.into_iter().collect(),
                 discovery_interval_secs: 15,
                 ..Default::default()
             },
@@ -132,7 +132,7 @@ pub struct DiscoveryConfig {
     #[serde(default = "default_mdns_service")]
     pub mdns_service_type: String,
 
-    /// Bootstrap nodes (known peers to ask for peer lists)
+    /// Bootstrap nodes (optional - mDNS provides zero-config discovery)
     #[serde(default)]
     pub bootstrap_nodes: Vec<SocketAddr>,
 
