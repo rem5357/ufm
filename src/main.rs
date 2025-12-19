@@ -124,12 +124,24 @@ struct NetworkSettings {
     /// Bootstrap nodes for P2P discovery (e.g., ["192.168.1.100:9847"])
     #[serde(default)]
     bootstrap_nodes: Vec<String>,
+
+    /// Network security settings
+    #[serde(default)]
+    security: NetworkSecuritySettings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct NetworkSecuritySettings {
+    /// Only allow connections from Tailscale network
+    #[serde(default)]
+    tailscale_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SecurityConfig {
     /// Allowed root directories (empty = user's home directory)
-    #[serde(default)]
+    /// Accepts both "allowed_roots" and "allowed_paths" in config for compatibility
+    #[serde(default, alias = "allowed_paths")]
     allowed_roots: Vec<PathBuf>,
 
     /// Explicitly denied paths
@@ -495,6 +507,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut network_config = NetworkConfig::default();
         network_config.enabled = true;
         network_config.listen_port = args.port;
+
+        // Load security settings from config
+        network_config.security.tailscale_only = config.network.security.tailscale_only;
+        if network_config.security.tailscale_only {
+            tracing::info!("Tailscale-only mode enabled - will only accept connections from Tailscale network");
+        }
 
         // Load bootstrap nodes from config
         for node_str in &config.network.bootstrap_nodes {

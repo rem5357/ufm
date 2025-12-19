@@ -154,6 +154,134 @@ pub struct BatchError {
     pub error: String,
 }
 
+/// Error kinds for detailed batch operation reporting
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum BatchErrorKind {
+    NotFound,
+    PermissionDenied,
+    InUse,
+    IsDirectory,
+    NotEmpty,
+    SecurityBlocked,
+    NoSpace,
+    AlreadyExists,
+    SourceNotFound,
+    CrossDevice,
+    Other,
+}
+
+impl From<&io::Error> for BatchErrorKind {
+    fn from(err: &io::Error) -> Self {
+        match err.kind() {
+            io::ErrorKind::NotFound => BatchErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied => BatchErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists => BatchErrorKind::AlreadyExists,
+            _ => {
+                // Check for platform-specific error codes
+                if let Some(code) = err.raw_os_error() {
+                    #[cfg(windows)]
+                    {
+                        // Windows error codes
+                        match code {
+                            32 | 33 => return BatchErrorKind::InUse, // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+                            112 => return BatchErrorKind::NoSpace,    // ERROR_DISK_FULL
+                            145 => return BatchErrorKind::NotEmpty,   // ERROR_DIR_NOT_EMPTY
+                            17 => return BatchErrorKind::CrossDevice, // ERROR_NOT_SAME_DEVICE
+                            _ => {}
+                        }
+                    }
+                    #[cfg(unix)]
+                    {
+                        // Unix error codes (from libc)
+                        match code {
+                            11 | 35 => return BatchErrorKind::InUse,  // EAGAIN, EWOULDBLOCK
+                            28 => return BatchErrorKind::NoSpace,      // ENOSPC
+                            39 | 66 => return BatchErrorKind::NotEmpty, // ENOTEMPTY
+                            18 => return BatchErrorKind::CrossDevice,  // EXDEV
+                            _ => {}
+                        }
+                    }
+                }
+                BatchErrorKind::Other
+            }
+        }
+    }
+}
+
+/// Detailed failure info for batch delete operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteFailure {
+    pub path: PathBuf,
+    pub error_kind: BatchErrorKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<i32>,
+    pub message: String,
+}
+
+/// Result of a batch delete operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchDeleteResult {
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failures: Vec<DeleteFailure>,
+    pub skipped: usize,
+}
+
+/// A single copy operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyOperation {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+/// Detailed failure info for batch copy operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyFailure {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub error_kind: BatchErrorKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<i32>,
+    pub message: String,
+}
+
+/// Result of a batch copy operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCopyResult {
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failures: Vec<CopyFailure>,
+    pub total_bytes_copied: u64,
+}
+
+/// A single move operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveOperation {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+/// Detailed failure info for batch move operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveFailure {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub error_kind: BatchErrorKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<i32>,
+    pub message: String,
+}
+
+/// Result of a batch move operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchMoveResult {
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failures: Vec<MoveFailure>,
+    pub total_files_moved: usize,
+}
+
 /// Core file manager
 pub struct FileManager {
     policy: SecurityPolicy,
@@ -622,7 +750,424 @@ impl FileManager {
         
         result
     }
-    
+
+    /// Delete multiple files/directories in a single operation
+    pub fn batch_delete(
+        &self,
+        paths: &[PathBuf],
+        recursive: bool,
+        ignore_missing: bool,
+        continue_on_error: bool,
+    ) -> BatchDeleteResult {
+        let mut result = BatchDeleteResult {
+            succeeded: 0,
+            failed: 0,
+            failures: Vec::new(),
+            skipped: 0,
+        };
+
+        for path in paths {
+            // Security validation
+            let safe_path = match self.policy.validate_delete(path) {
+                Ok(p) => p,
+                Err(e) => {
+                    result.failed += 1;
+                    result.failures.push(DeleteFailure {
+                        path: path.clone(),
+                        error_kind: BatchErrorKind::SecurityBlocked,
+                        error_code: None,
+                        message: e.to_string(),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // Check existence
+            if !safe_path.exists() {
+                if ignore_missing {
+                    result.skipped += 1;
+                } else {
+                    result.failed += 1;
+                    result.failures.push(DeleteFailure {
+                        path: path.clone(),
+                        error_kind: BatchErrorKind::NotFound,
+                        error_code: None,
+                        message: "File or directory not found".to_string(),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // Perform deletion
+            let delete_result = if safe_path.is_dir() {
+                if recursive {
+                    fs::remove_dir_all(&safe_path)
+                } else {
+                    fs::remove_dir(&safe_path)
+                }
+            } else {
+                fs::remove_file(&safe_path)
+            };
+
+            match delete_result {
+                Ok(_) => result.succeeded += 1,
+                Err(e) => {
+                    result.failed += 1;
+                    let error_kind = if safe_path.is_dir() && !recursive {
+                        BatchErrorKind::IsDirectory
+                    } else {
+                        BatchErrorKind::from(&e)
+                    };
+                    result.failures.push(DeleteFailure {
+                        path: path.clone(),
+                        error_kind,
+                        error_code: e.raw_os_error(),
+                        message: e.to_string(),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Copy multiple files/directories in a single operation
+    pub fn batch_copy(
+        &self,
+        operations: &[CopyOperation],
+        overwrite: bool,
+        preserve_metadata: bool,
+        continue_on_error: bool,
+    ) -> BatchCopyResult {
+        let mut result = BatchCopyResult {
+            succeeded: 0,
+            failed: 0,
+            failures: Vec::new(),
+            total_bytes_copied: 0,
+        };
+
+        for op in operations {
+            // Security validation for source
+            let safe_from = match self.policy.validate_path(&op.from) {
+                Ok(p) => p,
+                Err(e) => {
+                    result.failed += 1;
+                    result.failures.push(CopyFailure {
+                        from: op.from.clone(),
+                        to: op.to.clone(),
+                        error_kind: BatchErrorKind::SecurityBlocked,
+                        error_code: None,
+                        message: format!("Source: {}", e),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // Security validation for destination
+            let safe_to = match self.policy.validate_write(&op.to) {
+                Ok(p) => p,
+                Err(e) => {
+                    result.failed += 1;
+                    result.failures.push(CopyFailure {
+                        from: op.from.clone(),
+                        to: op.to.clone(),
+                        error_kind: BatchErrorKind::SecurityBlocked,
+                        error_code: None,
+                        message: format!("Destination: {}", e),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // Check source exists
+            if !safe_from.exists() {
+                result.failed += 1;
+                result.failures.push(CopyFailure {
+                    from: op.from.clone(),
+                    to: op.to.clone(),
+                    error_kind: BatchErrorKind::SourceNotFound,
+                    error_code: None,
+                    message: "Source file not found".to_string(),
+                });
+                if !continue_on_error {
+                    break;
+                }
+                continue;
+            }
+
+            // Check destination exists (if not overwriting)
+            if !overwrite && safe_to.exists() {
+                result.failed += 1;
+                result.failures.push(CopyFailure {
+                    from: op.from.clone(),
+                    to: op.to.clone(),
+                    error_kind: BatchErrorKind::AlreadyExists,
+                    error_code: None,
+                    message: "Destination already exists".to_string(),
+                });
+                if !continue_on_error {
+                    break;
+                }
+                continue;
+            }
+
+            // Ensure parent directory exists
+            if let Some(parent) = safe_to.parent() {
+                if !parent.exists() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        result.failed += 1;
+                        result.failures.push(CopyFailure {
+                            from: op.from.clone(),
+                            to: op.to.clone(),
+                            error_kind: BatchErrorKind::from(&e),
+                            error_code: e.raw_os_error(),
+                            message: format!("Failed to create parent directory: {}", e),
+                        });
+                        if !continue_on_error {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Perform copy
+            let copy_result = if safe_from.is_dir() {
+                self.copy_dir_recursive(&safe_from, &safe_to, overwrite, preserve_metadata)
+            } else {
+                fs::copy(&safe_from, &safe_to).map(|bytes| bytes)
+            };
+
+            match copy_result {
+                Ok(bytes) => {
+                    result.succeeded += 1;
+                    result.total_bytes_copied += bytes;
+
+                    // Preserve metadata if requested
+                    if preserve_metadata {
+                        let _ = self.copy_metadata(&safe_from, &safe_to);
+                    }
+                }
+                Err(e) => {
+                    result.failed += 1;
+                    result.failures.push(CopyFailure {
+                        from: op.from.clone(),
+                        to: op.to.clone(),
+                        error_kind: BatchErrorKind::from(&e),
+                        error_code: e.raw_os_error(),
+                        message: e.to_string(),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Helper: recursively copy a directory
+    fn copy_dir_recursive(
+        &self,
+        from: &Path,
+        to: &Path,
+        overwrite: bool,
+        preserve_metadata: bool,
+    ) -> io::Result<u64> {
+        let mut total_bytes = 0u64;
+
+        fs::create_dir_all(to)?;
+
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let src = entry.path();
+            let dst = to.join(entry.file_name());
+
+            if file_type.is_dir() {
+                total_bytes += self.copy_dir_recursive(&src, &dst, overwrite, preserve_metadata)?;
+            } else {
+                if !overwrite && dst.exists() {
+                    continue;
+                }
+                total_bytes += fs::copy(&src, &dst)?;
+                if preserve_metadata {
+                    let _ = self.copy_metadata(&src, &dst);
+                }
+            }
+        }
+
+        if preserve_metadata {
+            let _ = self.copy_metadata(from, to);
+        }
+
+        Ok(total_bytes)
+    }
+
+    /// Helper: copy file metadata (timestamps)
+    fn copy_metadata(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let metadata = fs::metadata(from)?;
+        if let Ok(mtime) = metadata.modified() {
+            let _ = set_file_mtime(to, FileTime::from_system_time(mtime));
+        }
+        Ok(())
+    }
+
+    /// Move multiple files/directories in a single operation
+    pub fn batch_move(
+        &self,
+        operations: &[MoveOperation],
+        overwrite: bool,
+        continue_on_error: bool,
+    ) -> BatchMoveResult {
+        let mut result = BatchMoveResult {
+            succeeded: 0,
+            failed: 0,
+            failures: Vec::new(),
+            total_files_moved: 0,
+        };
+
+        for op in operations {
+            // Security validation for source
+            let safe_from = match self.policy.validate_write(&op.from) {
+                Ok(p) => p,
+                Err(e) => {
+                    result.failed += 1;
+                    result.failures.push(MoveFailure {
+                        from: op.from.clone(),
+                        to: op.to.clone(),
+                        error_kind: BatchErrorKind::SecurityBlocked,
+                        error_code: None,
+                        message: format!("Source: {}", e),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // Security validation for destination
+            let safe_to = match self.policy.validate_write(&op.to) {
+                Ok(p) => p,
+                Err(e) => {
+                    result.failed += 1;
+                    result.failures.push(MoveFailure {
+                        from: op.from.clone(),
+                        to: op.to.clone(),
+                        error_kind: BatchErrorKind::SecurityBlocked,
+                        error_code: None,
+                        message: format!("Destination: {}", e),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // Check source exists
+            if !safe_from.exists() {
+                result.failed += 1;
+                result.failures.push(MoveFailure {
+                    from: op.from.clone(),
+                    to: op.to.clone(),
+                    error_kind: BatchErrorKind::SourceNotFound,
+                    error_code: None,
+                    message: "Source file not found".to_string(),
+                });
+                if !continue_on_error {
+                    break;
+                }
+                continue;
+            }
+
+            // Check destination exists (if not overwriting)
+            if !overwrite && safe_to.exists() {
+                result.failed += 1;
+                result.failures.push(MoveFailure {
+                    from: op.from.clone(),
+                    to: op.to.clone(),
+                    error_kind: BatchErrorKind::AlreadyExists,
+                    error_code: None,
+                    message: "Destination already exists".to_string(),
+                });
+                if !continue_on_error {
+                    break;
+                }
+                continue;
+            }
+
+            // Ensure parent directory exists
+            if let Some(parent) = safe_to.parent() {
+                if !parent.exists() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        result.failed += 1;
+                        result.failures.push(MoveFailure {
+                            from: op.from.clone(),
+                            to: op.to.clone(),
+                            error_kind: BatchErrorKind::from(&e),
+                            error_code: e.raw_os_error(),
+                            message: format!("Failed to create parent directory: {}", e),
+                        });
+                        if !continue_on_error {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Remove destination if overwriting
+            if overwrite && safe_to.exists() {
+                let _ = if safe_to.is_dir() {
+                    fs::remove_dir_all(&safe_to)
+                } else {
+                    fs::remove_file(&safe_to)
+                };
+            }
+
+            // Perform move
+            match fs::rename(&safe_from, &safe_to) {
+                Ok(_) => {
+                    result.succeeded += 1;
+                    result.total_files_moved += 1;
+                }
+                Err(e) => {
+                    result.failed += 1;
+                    result.failures.push(MoveFailure {
+                        from: op.from.clone(),
+                        to: op.to.clone(),
+                        error_kind: BatchErrorKind::from(&e),
+                        error_code: e.raw_os_error(),
+                        message: e.to_string(),
+                    });
+                    if !continue_on_error {
+                        break;
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     /// Check if path exists
     pub fn exists(&self, path: &Path) -> Result<bool> {
         let safe_path = self.policy.validate_path(path)?;

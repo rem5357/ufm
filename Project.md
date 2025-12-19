@@ -16,8 +16,8 @@
 
 ## Project Status
 
-**Version**: 0.50.0
-**Build**: 145
+**Version**: 1.0.0
+**Build**: 160
 **Status**: Active Development
 **Last Updated**: 2025-12-15
 
@@ -28,6 +28,118 @@
 ---
 
 ## Development History
+
+### Session 11: Batch Operations (2025-12-15)
+
+#### Summary
+Implemented three new batch operation tools for efficient bulk file management. Dramatically reduces context window usage and round-trips for operations on many files.
+
+#### New Tools
+
+1. **ufm_batch_delete** - Delete multiple files/directories in one call
+   - Parameters: `paths[]`, `recursive`, `ignore_missing`, `continue_on_error`, `node`
+   - Returns: `{succeeded, failed, failures[], skipped}`
+
+2. **ufm_batch_copy** - Copy multiple files/directories in one call
+   - Parameters: `operations[{from, to}]`, `overwrite`, `preserve_metadata`, `continue_on_error`, `node`
+   - Returns: `{succeeded, failed, failures[], total_bytes_copied}`
+
+3. **ufm_batch_move** - Move/rename multiple files in one call
+   - Parameters: `operations[{from, to}]`, `overwrite`, `continue_on_error`, `node`
+   - Returns: `{succeeded, failed, failures[], total_files_moved}`
+
+#### Error Reporting
+All batch operations return detailed `BatchErrorKind` for failures:
+- `NotFound`, `PermissionDenied`, `InUse`, `IsDirectory`, `NotEmpty`
+- `SecurityBlocked`, `NoSpace`, `AlreadyExists`, `SourceNotFound`, `CrossDevice`, `Other`
+
+#### Example Usage
+```
+# Delete 1000 .tmp files in one call instead of 1000 separate calls
+ufm_batch_delete(paths=[...1000 paths...], recursive=false)
+→ {succeeded: 997, failed: 3, failures: [...]}
+```
+
+#### Build History
+- Build 160: Batch operations (delete, copy, move)
+
+---
+
+### Session 10: Security Path Validation Bug Fix (2025-12-15)
+
+#### Summary
+Fixed critical bug where reads were denied on paths that should be allowed. Two root causes identified and fixed.
+
+#### Bug Report
+- Transfers TO `C:\Users\rober\Downloads` succeeded
+- Reads FROM `C:\Users\rober\Downloads` failed with "outside allowed roots"
+- Config had `allowed_paths` but code expected `allowed_roots`
+
+#### Root Causes
+
+1. **Config field name mismatch**: Config file used `allowed_paths` but struct expected `allowed_roots`. Serde silently ignored the unrecognized field and used empty default.
+
+2. **Path normalization mismatch**: `normalize_root()` used `canonicalize()` returning `\\?\C:\Users\rober` on Windows, but `normalize_path()` used `normalize()` returning `C:\Users\rober`. The `starts_with` check failed due to the `\\?\` prefix difference.
+
+#### Fixes Applied
+
+1. Added serde alias: `#[serde(alias = "allowed_paths")]` for backwards compatibility
+2. Changed `normalize_root()` to use `normalize()` instead of `canonicalize()` for consistency
+3. Added tilde (`~`) expansion to home directory
+4. Added debug logging for security checks
+
+#### Build History
+- Build 156: Security path validation fix
+
+---
+
+### Session 9: Version 1.0.0 Release (2025-12-15)
+
+#### Summary
+Promoted UFM to version 1.0.0, synchronizing Linux and Windows builds.
+
+#### What Was Accomplished
+- Bumped version from 0.50.0 to 1.0.0
+- Built and deployed both Linux and Windows binaries (build 153)
+- Updated goldshire daemon to 1.0.0
+- Windows (Falcon) can auto-update via `ufm --update`
+
+#### Build History
+- Build 153: Version 1.0.0 release
+
+---
+
+### Session 8: Network Interface Monitoring (2025-12-15)
+
+#### Summary
+Implemented automatic network interface monitoring. When network interfaces come up (e.g., WiFi connects, VPN starts), UFM immediately triggers peer discovery instead of waiting for the 30-second polling interval.
+
+#### What Was Accomplished
+
+1. **Network Interface Monitor Module**
+   - New `src/network/monitor.rs` with `NetworkMonitor` struct
+   - Uses `if-watch` crate for cross-platform interface watching
+   - Monitors `IfEvent::Up` and `IfEvent::Down` events
+   - Triggers immediate discovery via `discover_now()` on interface up
+
+2. **Dependencies Added**
+   - `if-watch = { version = "3.2", features = ["tokio"] }`
+   - `futures = "0.3"` for `StreamExt` trait
+
+3. **Integration**
+   - Monitor spawned as async task in `NetworkService::start()`
+   - Logs all interface changes for debugging
+   - Shares `DiscoveryManager` via `Arc<RwLock<>>`
+
+#### Test Results
+- Monitor detected all interfaces: loopback (127.0.0.1/8), LAN (192.168.86.112/24), Tailscale (100.102.6.85/32), Docker (172.17.0.1/16)
+- Discovery triggered automatically on interface up
+- Found peer Falcon via mDNS after interface detection
+
+#### Build History
+- Build 152: Network interface monitoring with immediate discovery
+
+---
 
 ### Session 7: Streaming Transfers (2025-12-15)
 

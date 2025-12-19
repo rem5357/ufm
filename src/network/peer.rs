@@ -209,13 +209,38 @@ impl PeerManager {
 
     /// Start listening for incoming connections
     pub async fn start_listener(&self, addr: &str) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("Listening for peer connections on {}", addr);
+        let listener = if self.config.security.tailscale_only {
+            // Bind only to Tailscale interface
+            match super::tailscale::bind_tailscale_only(self.config.listen_port).await {
+                Ok(listener) => {
+                    tracing::info!("Listening on Tailscale interface only (port {})", self.config.listen_port);
+                    listener
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to bind to Tailscale interface: {}. Is Tailscale running?", e);
+                }
+            }
+        } else {
+            let listener = TcpListener::bind(addr).await?;
+            tracing::info!("Listening for peer connections on {}", addr);
+            listener
+        };
+
 
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     tracing::debug!("Incoming connection from {}", peer_addr);
+
+                    // Verify connection is from Tailscale if required
+                    if self.config.security.tailscale_only {
+                        if let Err(e) = super::tailscale::verify_tailscale_source(peer_addr) {
+                            tracing::warn!("Rejected connection from {}: {}", peer_addr, e);
+                            continue;
+                        }
+                        tracing::debug!("Verified Tailscale connection from {}", peer_addr);
+                    }
+
                     // Handle in background
                     let identity = self.identity.clone();
                     // Get tool executor if available

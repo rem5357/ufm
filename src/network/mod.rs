@@ -10,6 +10,8 @@ pub mod discovery;
 pub mod router;
 pub mod config;
 pub mod transfer;
+pub mod monitor;
+pub mod tailscale;
 
 pub use identity::{NodeIdentity, Capability};
 pub use protocol::{PeerMessage, ToolResult, PROTOCOL_VERSION};
@@ -18,6 +20,8 @@ pub use discovery::DiscoveryManager;
 pub use router::RequestRouter;
 pub use config::{NetworkConfig, DiscoveryConfig, TransferConfig, Compression};
 pub use transfer::{TransferManager, TransferInfo, TransferState, TransferDirection};
+pub use monitor::NetworkMonitor;
+pub use tailscale::{is_tailscale_ip, get_tailscale_ip, check_tailscale_status, TailscaleStatus};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -97,6 +101,17 @@ impl NetworkService {
             let mut discovery = self.discovery.write().await;
             discovery.start().await?;
         }
+
+        // Start network interface monitor
+        let monitor = NetworkMonitor::new(
+            self.discovery.clone(),
+            self.peers.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = monitor.start().await {
+                tracing::error!("Network monitor failed: {}", e);
+            }
+        });
 
         Ok(())
     }

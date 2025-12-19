@@ -79,11 +79,22 @@ impl Default for SecurityPolicy {
 impl SecurityPolicy {
     /// Create a new security policy with specified allowed roots
     pub fn new(allowed_roots: Vec<PathBuf>) -> Self {
-        // Normalize and canonicalize allowed roots for consistent comparison
+        // Normalize allowed roots for consistent comparison
         let normalized_roots: Vec<PathBuf> = allowed_roots
             .into_iter()
-            .filter_map(|root| Self::normalize_root(&root))
+            .filter_map(|root| {
+                let normalized = Self::normalize_root(&root);
+                tracing::info!(
+                    "Security: Allowed root '{}' -> {:?}",
+                    root.display(),
+                    normalized.as_ref().map(|p| p.display().to_string())
+                );
+                normalized
+            })
             .collect();
+
+        tracing::info!("Security: {} allowed roots configured", normalized_roots.len());
+
         Self {
             allowed_roots: normalized_roots,
             ..Default::default()
@@ -94,7 +105,11 @@ impl SecurityPolicy {
     /// Still blocks system-critical paths
     pub fn permissive() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let normalized = Self::normalize_root(&home).unwrap_or(home);
+        let normalized = Self::normalize_root(&home).unwrap_or_else(|| home.clone());
+        tracing::info!(
+            "Security: Permissive policy using home directory: {}",
+            normalized.display()
+        );
         Self {
             allowed_roots: vec![normalized],
             ..Default::default()
@@ -114,9 +129,16 @@ impl SecurityPolicy {
 
     /// Normalize a root path for consistent comparison
     fn normalize_root(path: &Path) -> Option<PathBuf> {
-        // Try to canonicalize if the path exists
+        // First, expand tilde to home directory
+        let expanded = expand_tilde(path);
+        let path = expanded.as_ref().map(|p| p.as_path()).unwrap_or(path);
+
+        // Try to normalize if the path exists
+        // Use normalize() instead of canonicalize() to avoid \\?\ prefix on Windows
         if path.exists() {
-            path.canonicalize().ok()
+            path.normalize()
+                .map(|p| p.into_path_buf())
+                .ok()
         } else {
             // For non-existent paths, just clean them up
             Some(clean_path(path))
@@ -285,22 +307,43 @@ impl SecurityPolicy {
     fn is_within_allowed_roots(&self, path: &Path) -> bool {
         if self.allowed_roots.is_empty() {
             // No roots specified = nothing allowed
+            tracing::debug!("Security: No allowed roots configured");
             return false;
         }
 
-        self.allowed_roots.iter().any(|root| {
+        let result = self.allowed_roots.iter().any(|root| {
             // On Windows, paths are case-insensitive
             #[cfg(windows)]
             {
                 let path_lower = path.to_string_lossy().to_lowercase();
                 let root_lower = root.to_string_lossy().to_lowercase();
-                path_lower.starts_with(&root_lower)
+                let matches = path_lower.starts_with(&root_lower);
+                tracing::trace!(
+                    "Security check: '{}' starts_with '{}' = {}",
+                    path_lower, root_lower, matches
+                );
+                matches
             }
             #[cfg(not(windows))]
             {
-                path.starts_with(root)
+                let matches = path.starts_with(root);
+                tracing::trace!(
+                    "Security check: '{}' starts_with '{}' = {}",
+                    path.display(), root.display(), matches
+                );
+                matches
             }
-        })
+        });
+
+        if !result {
+            tracing::debug!(
+                "Security: Path '{}' not within allowed roots: {:?}",
+                path.display(),
+                self.allowed_roots
+            );
+        }
+
+        result
     }
     
     /// Check if path matches any denied pattern
@@ -337,7 +380,7 @@ impl SecurityPolicy {
 /// Clean a path without filesystem access
 fn clean_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
-    
+
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
@@ -354,8 +397,20 @@ fn clean_path(path: &Path) -> PathBuf {
             }
         }
     }
-    
+
     components.iter().collect()
+}
+
+/// Expand tilde (~) to home directory
+fn expand_tilde(path: &Path) -> Option<PathBuf> {
+    let path_str = path.to_string_lossy();
+    if path_str == "~" {
+        dirs::home_dir()
+    } else if path_str.starts_with("~/") || path_str.starts_with("~\\") {
+        dirs::home_dir().map(|home| home.join(&path_str[2..]))
+    } else {
+        None
+    }
 }
 
 /// Helper to get common safe directories

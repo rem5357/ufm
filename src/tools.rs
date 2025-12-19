@@ -224,6 +224,10 @@ Archive paths use :: notation: /path/to/archive.zip::internal/path"#
             "ufm_discover" => handle_discover(self.state.clone(), args).await,
             "ufm_transfer" => handle_transfer(self.state.clone(), args).await,
             "ufm_transfer_status" => handle_transfer_status(self.state.clone(), args).await,
+            // Batch operations
+            "ufm_batch_delete" => handle_batch_delete(self.state.clone(), args).await,
+            "ufm_batch_copy" => handle_batch_copy(self.state.clone(), args).await,
+            "ufm_batch_move" => handle_batch_move(self.state.clone(), args).await,
             _ => Err(format!("Unknown tool: {}", name)),
         };
 
@@ -272,6 +276,10 @@ pub fn get_tools() -> Vec<Tool> {
         discover_tool(),
         transfer_tool(),
         transfer_status_tool(),
+        // Batch operations
+        batch_delete_tool(),
+        batch_copy_tool(),
+        batch_move_tool(),
     ]
 }
 
@@ -1009,6 +1017,117 @@ fn transfer_status_tool() -> Tool {
                     "description": "Specific transfer ID to check (omit to list all)"
                 }
             }
+        }),
+    )
+}
+
+fn batch_delete_tool() -> Tool {
+    Tool::new(
+        "ufm_batch_delete",
+        "Delete multiple files and/or directories in a single operation. Returns summary with success/failure counts.",
+        json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of paths to delete"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Delete directories recursively"
+                },
+                "ignore_missing": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Don't report errors for already-deleted files"
+                },
+                "continue_on_error": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Continue processing after failures"
+                },
+                "node": node_param_schema()
+            },
+            "required": ["paths"]
+        }),
+    )
+}
+
+fn batch_copy_tool() -> Tool {
+    Tool::new(
+        "ufm_batch_copy",
+        "Copy multiple files/directories in a single operation. Returns summary with bytes copied.",
+        json!({
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "from": {"type": "string", "description": "Source path"},
+                            "to": {"type": "string", "description": "Destination path"}
+                        },
+                        "required": ["from", "to"]
+                    },
+                    "description": "List of copy operations [{from, to}, ...]"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Overwrite existing destinations"
+                },
+                "preserve_metadata": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Preserve timestamps and permissions"
+                },
+                "continue_on_error": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Continue processing after failures"
+                },
+                "node": node_param_schema()
+            },
+            "required": ["operations"]
+        }),
+    )
+}
+
+fn batch_move_tool() -> Tool {
+    Tool::new(
+        "ufm_batch_move",
+        "Move/rename multiple files in a single operation. Returns summary with files moved count.",
+        json!({
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "from": {"type": "string", "description": "Source path"},
+                            "to": {"type": "string", "description": "Destination path"}
+                        },
+                        "required": ["from", "to"]
+                    },
+                    "description": "List of move operations [{from, to}, ...]"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Overwrite existing destinations"
+                },
+                "continue_on_error": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Continue processing after failures"
+                },
+                "node": node_param_schema()
+            },
+            "required": ["operations"]
         }),
     )
 }
@@ -2463,4 +2582,103 @@ async fn handle_transfer_status(state: Arc<ToolState>, args: Value) -> ToolResul
             "note": "Transfer tracking not yet implemented - transfers complete synchronously"
         }).to_string())
     }
+}
+
+// ============================================================================
+// Batch Operation Handlers
+// ============================================================================
+
+async fn handle_batch_delete(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote execution
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_batch_delete").await? {
+        return Ok(result);
+    }
+
+    let paths: Vec<PathBuf> = args["paths"]
+        .as_array()
+        .ok_or("paths must be an array")?
+        .iter()
+        .filter_map(|v| v.as_str().map(PathBuf::from))
+        .collect();
+
+    if paths.is_empty() {
+        return Err("paths array cannot be empty".to_string());
+    }
+
+    let recursive = args["recursive"].as_bool().unwrap_or(false);
+    let ignore_missing = args["ignore_missing"].as_bool().unwrap_or(true);
+    let continue_on_error = args["continue_on_error"].as_bool().unwrap_or(true);
+
+    let result = state.file_manager.batch_delete(&paths, recursive, ignore_missing, continue_on_error);
+
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+}
+
+async fn handle_batch_copy(state: Arc<ToolState>, args: Value) -> ToolResult {
+    use crate::operations::CopyOperation;
+
+    // Check for remote execution
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_batch_copy").await? {
+        return Ok(result);
+    }
+
+    let operations: Vec<CopyOperation> = args["operations"]
+        .as_array()
+        .ok_or("operations must be an array")?
+        .iter()
+        .filter_map(|v| {
+            let from = v["from"].as_str()?;
+            let to = v["to"].as_str()?;
+            Some(CopyOperation {
+                from: PathBuf::from(from),
+                to: PathBuf::from(to),
+            })
+        })
+        .collect();
+
+    if operations.is_empty() {
+        return Err("operations array cannot be empty".to_string());
+    }
+
+    let overwrite = args["overwrite"].as_bool().unwrap_or(false);
+    let preserve_metadata = args["preserve_metadata"].as_bool().unwrap_or(true);
+    let continue_on_error = args["continue_on_error"].as_bool().unwrap_or(true);
+
+    let result = state.file_manager.batch_copy(&operations, overwrite, preserve_metadata, continue_on_error);
+
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+}
+
+async fn handle_batch_move(state: Arc<ToolState>, args: Value) -> ToolResult {
+    use crate::operations::MoveOperation;
+
+    // Check for remote execution
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_batch_move").await? {
+        return Ok(result);
+    }
+
+    let operations: Vec<MoveOperation> = args["operations"]
+        .as_array()
+        .ok_or("operations must be an array")?
+        .iter()
+        .filter_map(|v| {
+            let from = v["from"].as_str()?;
+            let to = v["to"].as_str()?;
+            Some(MoveOperation {
+                from: PathBuf::from(from),
+                to: PathBuf::from(to),
+            })
+        })
+        .collect();
+
+    if operations.is_empty() {
+        return Err("operations array cannot be empty".to_string());
+    }
+
+    let overwrite = args["overwrite"].as_bool().unwrap_or(false);
+    let continue_on_error = args["continue_on_error"].as_bool().unwrap_or(true);
+
+    let result = state.file_manager.batch_move(&operations, overwrite, continue_on_error);
+
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
 }

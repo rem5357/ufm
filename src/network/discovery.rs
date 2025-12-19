@@ -18,6 +18,66 @@ use super::identity::NodeIdentity;
 use super::peer::PeerManager;
 use super::protocol::{DiscoveredPeer, DiscoverySource, PeerMessage};
 
+/// Check if an IP address is in the Tailscale CGNAT range (100.64.0.0/10)
+/// Tailscale uses this range for secure encrypted connections.
+/// Range: 100.64.0.0 - 100.127.255.255
+fn is_tailscale_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            // 100.64.0.0/10 means first octet is 100, second octet is 64-127
+            octets[0] == 100 && (octets[1] & 0xC0) == 64
+        }
+        std::net::IpAddr::V6(_) => false, // Tailscale doesn't use IPv6 for CGNAT
+    }
+}
+
+/// Resolve a hostname via system DNS and return any Tailscale IPs found.
+/// This leverages Tailscale's MagicDNS to get the Tailscale IP for a peer.
+fn resolve_tailscale_ip(hostname: &str, port: u16) -> Vec<SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    // Catch any panics during DNS resolution (Windows can be finicky)
+    let result = std::panic::catch_unwind(|| {
+        // Try various hostname formats that Tailscale DNS might resolve
+        let hostnames_to_try = [
+            hostname.to_lowercase(),                    // "falcon"
+            format!("{}.local", hostname.to_lowercase()), // "falcon.local"
+        ];
+
+        for host in &hostnames_to_try {
+            let addr_string = format!("{}:{}", host, port);
+            if let Ok(addrs) = addr_string.to_socket_addrs() {
+                let tailscale_addrs: Vec<SocketAddr> = addrs
+                    .filter(|addr| is_tailscale_ip(&addr.ip()))
+                    .collect();
+
+                if !tailscale_addrs.is_empty() {
+                    return tailscale_addrs;
+                }
+            }
+        }
+
+        Vec::new()
+    });
+
+    match result {
+        Ok(addrs) => {
+            if !addrs.is_empty() {
+                tracing::debug!(
+                    "DNS: Resolved {} to Tailscale IPs: {:?}",
+                    hostname, addrs
+                );
+            }
+            addrs
+        }
+        Err(_) => {
+            tracing::warn!("DNS: Resolution panicked for {}", hostname);
+            Vec::new()
+        }
+    }
+}
+
 /// Manages peer discovery via multiple methods
 pub struct DiscoveryManager {
     identity: NodeIdentity,
@@ -409,34 +469,59 @@ async fn collect_mdns_peers(
                             continue;
                         }
 
-                        let addresses: Vec<SocketAddr> = info
-                            .get_addresses()
+                        // Get all addresses from mDNS
+                        let all_addresses: Vec<_> = info.get_addresses().iter().collect();
+
+                        // Filter to only Tailscale IPs (100.64.0.0/10 CGNAT range)
+                        let addresses: Vec<SocketAddr> = all_addresses
                             .iter()
-                            .map(|ip| SocketAddr::new(*ip, info.get_port()))
+                            .filter(|ip| is_tailscale_ip(ip))
+                            .map(|ip| SocketAddr::new(**ip, info.get_port()))
                             .collect();
 
-                        if !addresses.is_empty() {
-                            let name = info.get_fullname().split('.').next()
-                                .unwrap_or("unknown").to_string();
+                        let name = info.get_fullname().split('.').next()
+                            .unwrap_or("unknown").to_string();
+
+                        // If we have Tailscale IPs from mDNS, use them
+                        let final_addresses = if !addresses.is_empty() {
                             tracing::info!(
-                                "mDNS: Discovered peer {} ({}) at {:?}",
-                                name, uuid, addresses
+                                "mDNS: Discovered peer {} ({}) at {:?} (filtered from {:?})",
+                                name, uuid, addresses, all_addresses
                             );
+                            addresses
+                        } else {
+                            // No Tailscale IPs in mDNS - try DNS resolution (Tailscale MagicDNS)
+                            tracing::debug!(
+                                "mDNS: No Tailscale IPs for {} in mDNS, trying DNS resolution",
+                                name
+                            );
+                            let dns_addresses = resolve_tailscale_ip(&name, info.get_port());
+                            if !dns_addresses.is_empty() {
+                                tracing::info!(
+                                    "mDNS: Discovered peer {} ({}) at {:?} via Tailscale DNS (mDNS had: {:?})",
+                                    name, uuid, dns_addresses, all_addresses
+                                );
+                                dns_addresses
+                            } else {
+                                tracing::warn!(
+                                    "mDNS: Service {} has no Tailscale IPs (mDNS: {:?}, DNS: none)",
+                                    name, all_addresses
+                                );
+                                Vec::new()
+                            }
+                        };
+
+                        if !final_addresses.is_empty() {
                             peers.push(DiscoveredPeer {
                                 name,
                                 uuid: Some(uuid),
-                                addresses,
+                                addresses: final_addresses,
                                 version: info
                                     .get_property_val_str("version")
                                     .map(|s| s.to_string()),
                                 os: info.get_property_val_str("os").map(|s| s.to_string()),
                                 source: DiscoverySource::Mdns,
                             });
-                        } else {
-                            tracing::warn!(
-                                "mDNS: Service resolved but no addresses for {}",
-                                info.get_fullname()
-                            );
                         }
                     } else {
                         tracing::warn!(
@@ -682,26 +767,60 @@ async fn lookup_dnssd_service(
     let (instance_name, hostname, port, uuid, version, os) = lookup_result;
 
     // Resolve hostname to IP address
-    let mut addresses = Vec::new();
+    let mut all_addresses: Vec<SocketAddr> = Vec::new();
     if !hostname.is_empty() {
         let host_port = format!("{}:{}", hostname.trim_end_matches('.'), port);
         if let Ok(addrs) = host_port.to_socket_addrs() {
-            addresses = addrs.collect();
+            all_addresses = addrs.collect();
         }
 
         // If hostname resolution failed, try without the .local suffix
-        if addresses.is_empty() {
+        if all_addresses.is_empty() {
             let clean_host = hostname.trim_end_matches('.').trim_end_matches(".local");
             let host_port = format!("{}:{}", clean_host, port);
             if let Ok(addrs) = host_port.to_socket_addrs() {
-                addresses = addrs.collect();
+                all_addresses = addrs.collect();
             }
         }
     }
 
-    if addresses.is_empty() {
-        anyhow::bail!("Could not resolve address for {}", instance_name);
+    // Filter to only Tailscale IPs (100.64.0.0/10 CGNAT range)
+    let mut addresses: Vec<SocketAddr> = all_addresses
+        .iter()
+        .filter(|addr| is_tailscale_ip(&addr.ip()))
+        .copied()
+        .collect();
+
+    // If no Tailscale IPs found, try DNS resolution (Tailscale MagicDNS)
+    if addresses.is_empty() && !all_addresses.is_empty() {
+        tracing::debug!(
+            "dns-sd: No Tailscale IPs for {} in resolution, trying Tailscale DNS",
+            instance_name
+        );
+        addresses = resolve_tailscale_ip(&instance_name, port);
+        if !addresses.is_empty() {
+            tracing::info!(
+                "dns-sd: Resolved {} to {:?} via Tailscale DNS (original: {:?})",
+                instance_name, addresses, all_addresses
+            );
+        }
     }
+
+    if addresses.is_empty() {
+        if all_addresses.is_empty() {
+            anyhow::bail!("Could not resolve address for {}", instance_name);
+        } else {
+            anyhow::bail!(
+                "No Tailscale IPs found for {} (had: {:?}, DNS: none)",
+                instance_name, all_addresses
+            );
+        }
+    }
+
+    tracing::debug!(
+        "dns-sd: Resolved {} to {:?} (filtered from {:?})",
+        instance_name, addresses, all_addresses
+    );
 
     Ok(DiscoveredPeer {
         name: instance_name,
