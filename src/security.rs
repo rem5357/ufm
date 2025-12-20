@@ -277,27 +277,29 @@ impl SecurityPolicy {
             }
         } else {
             // For non-existent paths, normalize what we can
-            // and ensure parent exists and is valid
-            let parent = path.parent().ok_or_else(|| {
-                SecurityError::InvalidPath("Path has no parent".to_string())
-            })?;
-            
-            if parent.exists() {
-                let normalized_parent = if self.follow_symlinks {
-                    parent.canonicalize()?
+            // Handle root paths (like C:\ or E:\) that have no parent
+            if let Some(parent) = path.parent() {
+                // Path has a parent - validate parent exists
+                if parent.exists() {
+                    let normalized_parent = if self.follow_symlinks {
+                        parent.canonicalize()?
+                    } else {
+                        parent.normalize()
+                            .map(|p| p.into_path_buf())
+                            .map_err(|e| SecurityError::InvalidPath(e.to_string()))?
+                    };
+
+                    let filename = path.file_name().ok_or_else(|| {
+                        SecurityError::InvalidPath("Path has no filename".to_string())
+                    })?;
+
+                    Ok(normalized_parent.join(filename))
                 } else {
-                    parent.normalize()
-                        .map(|p| p.into_path_buf())
-                        .map_err(|e| SecurityError::InvalidPath(e.to_string()))?
-                };
-                
-                let filename = path.file_name().ok_or_else(|| {
-                    SecurityError::InvalidPath("Path has no filename".to_string())
-                })?;
-                
-                Ok(normalized_parent.join(filename))
+                    // Neither path nor parent exists - just clean up the path
+                    Ok(clean_path(path))
+                }
             } else {
-                // Neither path nor parent exists - just clean up the path
+                // Root path (like C:\ or E:\) - just clean it
                 Ok(clean_path(path))
             }
         }

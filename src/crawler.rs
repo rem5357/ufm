@@ -51,9 +51,9 @@ pub struct CrawlEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created: Option<i64>,
     pub is_dir: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_hidden: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_symlink: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
@@ -108,10 +108,10 @@ pub struct CrawlResult {
     /// True if crawl is complete
     pub complete: bool,
     /// Directory metadata (only included if useful for change detection)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub directories_seen: Vec<DirMeta>,
     /// Errors encountered (non-fatal)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<CrawlErrorEntry>,
 }
 

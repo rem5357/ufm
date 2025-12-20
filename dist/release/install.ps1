@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Version info
-$Version = "0.11.0"
+$Version = "1.1.0"
 $UpdateUrl = "http://goldshire:8080/ufm"
 
 function Write-Status {

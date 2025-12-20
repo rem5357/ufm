@@ -16,10 +16,10 @@
 
 ## Project Status
 
-**Version**: 1.0.0
-**Build**: 160
+**Version**: 1.1.0
+**Build**: 195
 **Status**: Active Development
-**Last Updated**: 2025-12-15
+**Last Updated**: 2025-12-20
 
 ### Current Nodes
 - **Goldshire** (Linux): 192.168.86.112:9847 - Home server daemon
@@ -28,6 +28,51 @@
 ---
 
 ## Development History
+
+### Session 12: Root Path Validation Fix (2025-12-20)
+
+#### Summary
+Fixed critical bug in security validation that prevented root drive paths (like `E:\`) from being accessed, even when properly configured in `allowed_paths`. This affected Windows drive roots and other filesystem root paths.
+
+#### Bug Report
+- User added `E:\` to `allowed_paths` in UFM config on Windows
+- Scans of `E:\` drive from USM still failed with "Security error: Path 'E:\' is outside allowed roots"
+- Error occurred even after restarting UFM and confirming config was loaded correctly
+
+#### Root Cause
+The `normalize_path()` function in `src/security.rs` had logic to handle non-existent paths by validating their parent directory. However, root paths (like `E:\`, `C:\`, or `/` on Unix) have no parent directory. When `path.parent()` returned `None` for root paths, the code tried to unwrap it with `ok_or_else()`, causing an error: "Path has no parent".
+
+#### Fix Applied
+Modified `normalize_path()` in `src/security.rs:278-305` to handle root paths:
+- Changed from `ok_or_else()` (which errors on None) to `if let Some(parent)`
+- Added explicit handling for root paths (no parent) by calling `clean_path()` directly
+- Now properly validates root paths even if they don't exist or aren't accessible
+
+```rust
+// Old code (failed on root paths):
+let parent = path.parent().ok_or_else(|| {
+    SecurityError::InvalidPath("Path has no parent".to_string())
+})?;
+
+// New code (handles root paths):
+if let Some(parent) = path.parent() {
+    // Path has parent - validate normally
+    // ...
+} else {
+    // Root path (like C:\ or E:\) - just clean it
+    Ok(clean_path(path))
+}
+```
+
+#### Impact
+- Windows users can now access drive roots (C:\, D:\, E:\, etc.) when configured in allowed_paths
+- Unix users can access root (/) when configured
+- USM remote scanning can now scan entire drives on remote Windows nodes
+
+#### Build History
+- Build 195: Root path validation fix (v1.1.0)
+
+---
 
 ### Session 11: Batch Operations (2025-12-15)
 
