@@ -20,6 +20,36 @@ use xxhash_rust::xxh64::Xxh64;
 
 use crate::security::{SecurityPolicy, SecurityError};
 
+/// Helper module for normalizing path separators in serialization
+mod path_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Normalize Windows paths to use backslashes only
+        #[cfg(windows)]
+        {
+            let normalized = path.to_string_lossy().replace("/", "\\");
+            serializer.serialize_str(&normalized)
+        }
+        #[cfg(not(windows))]
+        {
+            serializer.serialize_str(&path.to_string_lossy())
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(PathBuf::from(s))
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum CrawlError {
     #[error("IO error: {0}")]
@@ -43,6 +73,7 @@ pub type Result<T> = std::result::Result<T, CrawlError>;
 /// A single file entry from the crawl - full metadata for Rust-to-Rust communication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlEntry {
+    #[serde(with = "path_serde")]
     pub path: PathBuf,
     pub name: String,
     pub extension: Option<String>,
@@ -62,6 +93,7 @@ pub struct CrawlEntry {
 /// Minimal entry format for Claude Desktop / low-bandwidth scenarios
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlEntryMinimal {
+    #[serde(with = "path_serde")]
     pub path: PathBuf,
     pub size: u64,
     pub modified: i64,
@@ -72,6 +104,7 @@ pub struct CrawlEntryMinimal {
 /// Directory metadata for change detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirMeta {
+    #[serde(with = "path_serde")]
     pub path: PathBuf,
     pub modified: i64,
     pub child_count: u32,
@@ -89,6 +122,7 @@ pub struct CrawlProgress {
 /// Error that occurred during crawl (non-fatal)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlErrorEntry {
+    #[serde(with = "path_serde")]
     pub path: PathBuf,
     pub error: String,
 }
@@ -97,6 +131,7 @@ pub struct CrawlErrorEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlResult {
     /// Root path - entries have paths relative to this
+    #[serde(with = "path_serde")]
     pub root: PathBuf,
     /// File/directory entries (paths are relative to root)
     pub entries: Vec<CrawlEntry>,
@@ -123,6 +158,10 @@ pub struct CrawlOptions {
     pub skip_patterns: Vec<Pattern>,
     pub max_depth: Option<usize>,
     pub dirs_only: bool,
+    /// Whether to collect directory metadata for future optimization.
+    /// Set to true for rescans to enable dir_check optimization.
+    /// Set to false for initial scans to ensure complete coverage.
+    pub collect_dir_metadata: bool,
 }
 
 impl Default for CrawlOptions {
@@ -133,6 +172,8 @@ impl Default for CrawlOptions {
             skip_patterns: Vec::new(),
             max_depth: None,
             dirs_only: false,
+            // Default to false for initial scans - callers should explicitly enable for rescans
+            collect_dir_metadata: false,
         }
     }
 }
@@ -157,6 +198,7 @@ struct ResumeToken {
 /// Result of directory check
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirCheckResult {
+    #[serde(with = "path_serde")]
     pub path: PathBuf,
     pub status: DirStatus,
     pub current_mtime: Option<i64>,
@@ -183,6 +225,7 @@ pub struct DirCheckSummary {
 /// Input for directory check
 #[derive(Debug, Clone, Deserialize)]
 pub struct DirCheckInput {
+    #[serde(with = "path_serde")]
     pub path: PathBuf,
     pub expected_mtime: i64,
     pub expected_children: Option<u32>,
@@ -191,6 +234,7 @@ pub struct DirCheckInput {
 /// Result of hash operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HashResult {
+    #[serde(with = "path_serde")]
     pub path: PathBuf,
     pub hash: String,
     pub algorithm: String,
@@ -359,19 +403,21 @@ impl Crawler {
             if is_dir {
                 progress.dirs_scanned += 1;
 
-                // Collect directory metadata for change detection
-                let child_count = count_children(path);
-                let modified = metadata.modified()
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0))
-                    .unwrap_or(0);
+                // Collect directory metadata for change detection (only for rescans)
+                if options.collect_dir_metadata {
+                    let child_count = count_children(path);
+                    let modified = metadata.modified()
+                        .map(|t| t.duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0))
+                        .unwrap_or(0);
 
-                directories_seen.push(DirMeta {
-                    path: path.to_path_buf(),
-                    modified,
-                    child_count,
-                });
+                    directories_seen.push(DirMeta {
+                        path: path.to_path_buf(),
+                        modified,
+                        child_count,
+                    });
+                }
 
                 if options.dirs_only {
                     // Add directory as an entry too
@@ -441,6 +487,10 @@ impl Crawler {
     }
 
     /// Check if directories have changed since last crawl
+    ///
+    /// WARNING: This should ONLY be used for rescans, not initial scans!
+    /// For initial scans, always do a full crawl to ensure complete coverage.
+    /// Use this optimization only when you have a valid baseline from a previous crawl.
     pub fn dir_check(&self, directories: &[DirCheckInput]) -> Result<(Vec<DirCheckResult>, DirCheckSummary)> {
         let mut results = Vec::with_capacity(directories.len());
         let mut summary = DirCheckSummary {

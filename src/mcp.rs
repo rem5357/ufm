@@ -163,12 +163,12 @@ pub trait McpServerHandler: Send + Sync {
 }
 
 /// Run the MCP server on stdio using async I/O
-pub async fn run_stdio_server<H: McpServerHandler + 'static>(handler: H) -> io::Result<()> {
+pub async fn run_stdio_server<H: McpServerHandler + 'static>(handler: std::sync::Arc<H>) -> io::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin);
 
-    let handler = std::sync::Arc::new(handler);
+    let handler = handler;
     let mut request_count: u64 = 0;
     let mut line = String::new();
 

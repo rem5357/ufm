@@ -156,7 +156,7 @@ if (-not $SkipClaudeConfig) {
             # Update or add UFM config
             $UfmConfig = @{
                 command = $UfmCommand
-                args = @("--network")
+                args = @()
                 alwaysAllow = @(
                     "ufm_list",
                     "ufm_stat",
@@ -192,7 +192,7 @@ if (-not $SkipClaudeConfig) {
             mcpServers = @{
                 ufm = @{
                     command = $UfmCommand
-                    args = @("--network")
+                    args = @()
                     alwaysAllow = @(
                         "ufm_list",
                         "ufm_stat",

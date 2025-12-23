@@ -1,9 +1,14 @@
 //! UFM - Universal File Manager
 //!
-//! A cross-platform MCP server for file management operations.
+//! A cross-platform MCP server for file management operations with P2P networking.
+//!
+//! UFM runs as a single process that handles:
+//! - MCP requests via stdio (for Claude Desktop)
+//! - MCP requests via HTTP (localhost:9847/mcp)
+//! - P2P connections from other UFM nodes (port 9847)
 //!
 //! Usage:
-//!   ufm                    # Start with default config
+//!   ufm                    # Start UFM (all features enabled)
 //!   ufm --config path.toml # Start with custom config
 //!   ufm --init             # Generate default config file
 //!   ufm --help             # Show help
@@ -18,14 +23,23 @@ mod security;
 mod tools;
 mod update;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::{
+    extract::State,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::mcp::run_stdio_server;
+use crate::mcp::{run_stdio_server, JsonRpcRequest, JsonRpcResponse, McpServerHandler};
 use crate::network::{NetworkConfig, NetworkService};
 use crate::security::SecurityPolicy;
 use crate::tools::UfmServer;
@@ -38,12 +52,12 @@ fn full_version() -> String {
     format!("{} (build {})", env!("CARGO_PKG_VERSION"), BUILD_NUMBER)
 }
 
-/// Command line arguments
+/// Command line arguments (simplified)
 #[derive(Parser, Debug)]
 #[command(name = "ufm")]
 #[command(author = "Robert")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "Universal File Manager - Cross-platform MCP file management")]
+#[command(about = "Universal File Manager - Cross-platform MCP file management with P2P networking")]
 struct Args {
     /// Path to configuration file
     #[arg(short, long)]
@@ -56,10 +70,6 @@ struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
-
-    /// Enable P2P networking for cross-machine file operations
-    #[arg(long)]
-    network: bool,
 
     /// P2P listen port (default: 9847)
     #[arg(long, default_value = "9847")]
@@ -77,11 +87,6 @@ struct Args {
     #[arg(long)]
     update: bool,
 
-    /// Run as a daemon (P2P network only, no MCP server)
-    /// Use this on headless servers that don't run Claude Desktop
-    #[arg(long)]
-    daemon: bool,
-
     /// Restart the UFM systemd service (Linux only)
     #[arg(long)]
     restart: bool,
@@ -93,6 +98,10 @@ struct Args {
     /// Show status of the UFM systemd service (Linux only)
     #[arg(long)]
     status: bool,
+
+    /// Disable stdio MCP (useful when running as a service)
+    #[arg(long)]
+    no_stdio: bool,
 }
 
 /// Configuration for UFM
@@ -125,22 +134,14 @@ struct NetworkSettings {
     #[serde(default)]
     bootstrap_nodes: Vec<String>,
 
-    /// Network security settings
-    #[serde(default)]
-    security: NetworkSecuritySettings,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct NetworkSecuritySettings {
-    /// Only allow connections from Tailscale network
-    #[serde(default)]
+    /// Only allow P2P connections from Tailscale network
+    #[serde(default = "default_true")]
     tailscale_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SecurityConfig {
     /// Allowed root directories (empty = user's home directory)
-    /// Accepts both "allowed_roots" and "allowed_paths" in config for compatibility
     #[serde(default, alias = "allowed_paths")]
     allowed_roots: Vec<PathBuf>,
 
@@ -285,13 +286,11 @@ fn handle_service_command(args: &Args) -> Result<(), Box<dyn std::error::Error>>
     let service_name = "ufm";
 
     if args.status {
-        // Show service status
         let status = Command::new("systemctl")
             .args(["status", service_name, "--no-pager"])
             .status()?;
-
         if !status.success() {
-            // systemctl status returns non-zero if service isn't running, which is fine
+            // systemctl status returns non-zero if service isn't running
         }
         return Ok(());
     }
@@ -301,7 +300,6 @@ fn handle_service_command(args: &Args) -> Result<(), Box<dyn std::error::Error>>
         let status = Command::new("sudo")
             .args(["systemctl", "stop", service_name])
             .status()?;
-
         if status.success() {
             println!("UFM service stopped.");
         } else {
@@ -315,10 +313,8 @@ fn handle_service_command(args: &Args) -> Result<(), Box<dyn std::error::Error>>
         let status = Command::new("sudo")
             .args(["systemctl", "restart", service_name])
             .status()?;
-
         if status.success() {
             println!("UFM service restarted.");
-            // Show brief status
             let _ = Command::new("systemctl")
                 .args(["status", service_name, "--no-pager", "-n", "5"])
                 .status();
@@ -330,6 +326,98 @@ fn handle_service_command(args: &Args) -> Result<(), Box<dyn std::error::Error>>
 
     Ok(())
 }
+
+// ============================================================================
+// HTTP MCP Server
+// ============================================================================
+
+/// Shared state for HTTP server
+struct HttpState {
+    handler: Arc<UfmServer>,
+}
+
+/// Health check endpoint
+async fn health_check() -> impl IntoResponse {
+    Json(json!({
+        "status": "ok",
+        "version": full_version()
+    }))
+}
+
+/// MCP endpoint - handles JSON-RPC requests
+async fn mcp_handler(
+    State(state): State<Arc<HttpState>>,
+    Json(request): Json<JsonRpcRequest>,
+) -> impl IntoResponse {
+    let id = request.id.clone().unwrap_or(Value::Null);
+
+    let response = match request.method.as_str() {
+        "initialize" => {
+            let result = json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": state.handler.capabilities(),
+                "serverInfo": state.handler.server_info(),
+                "instructions": state.handler.instructions()
+            });
+            JsonRpcResponse::success(id, result)
+        }
+        "tools/list" => {
+            let result = json!({
+                "tools": state.handler.list_tools()
+            });
+            JsonRpcResponse::success(id, result)
+        }
+        "tools/call" => {
+            let params = request.params.unwrap_or(json!({}));
+            let name = params["name"].as_str().unwrap_or("");
+            let arguments = params["arguments"].clone();
+
+            let tool_result = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                state.handler.call_tool(name, arguments),
+            )
+            .await;
+
+            match tool_result {
+                Ok(result) => {
+                    JsonRpcResponse::success(id, serde_json::to_value(result).unwrap_or(json!({})))
+                }
+                Err(_) => JsonRpcResponse::success(
+                    id,
+                    serde_json::to_value(mcp::CallToolResult::error(format!(
+                        "Tool '{}' timed out after 60 seconds",
+                        name
+                    )))
+                    .unwrap_or(json!({})),
+                ),
+            }
+        }
+        "ping" => JsonRpcResponse::success(id, json!({})),
+        _ => JsonRpcResponse::error(
+            id,
+            -32601,
+            &format!("Method not found: {}", request.method),
+        ),
+    };
+
+    Json(response)
+}
+
+/// Create the HTTP router
+fn create_http_router(handler: Arc<UfmServer>) -> Router {
+    let state = Arc::new(HttpState { handler });
+
+    Router::new()
+        .route("/", get(health_check))
+        .route("/health", get(health_check))
+        .route("/mcp", post(mcp_handler))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
+// ============================================================================
+// Main
+// ============================================================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -358,7 +446,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("You are running the latest version.");
             }
             update::UpdateStatus::UpdateAvailable(info) => {
-                println!("Update available: v{} (build {})", info.version, info.build);
+                println!(
+                    "Update available: v{} (build {})",
+                    info.version, info.build
+                );
                 if let Some(notes) = &info.release_notes {
                     println!("Release notes: {}", notes);
                 }
@@ -381,7 +472,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("You are already running the latest version.");
             }
             update::UpdateStatus::UpdateAvailable(info) => {
-                println!("Downloading update: v{} (build {})", info.version, info.build);
+                println!(
+                    "Downloading update: v{} (build {})",
+                    info.version, info.build
+                );
                 match update::apply_update(&info).await {
                     Ok(()) => {
                         println!("Update downloaded successfully!");
@@ -411,7 +505,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "linux"))]
     {
         if args.restart || args.stop || args.status {
-            eprintln!("Service commands (--restart, --stop, --status) are only available on Linux.");
+            eprintln!(
+                "Service commands (--restart, --stop, --status) are only available on Linux."
+            );
             return Ok(());
         }
     }
@@ -460,16 +556,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
-    // If a log file is configured, write to both stderr and file
     if let Some(ref log_path) = config.logging.file {
         use tracing_subscriber::fmt::writer::MakeWriterExt;
 
-        // Create log directory if needed
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        // Open log file in append mode
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -483,7 +576,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(std::io::stderr.and(file_writer))
-                    .with_ansi(false) // Disable colors for file output
+                    .with_ansi(false),
             )
             .init();
 
@@ -497,116 +590,152 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting UFM v{}", full_version());
 
-    // Create the UFM server
+    // Create the UFM server with P2P networking (always enabled)
     let policy = config.to_security_policy();
 
-    let ufm_server = if args.network {
-        // Initialize P2P networking
-        tracing::info!("Initializing P2P networking on port {}", args.port);
+    tracing::info!("Initializing P2P networking on port {}", args.port);
 
-        let mut network_config = NetworkConfig::default();
-        network_config.enabled = true;
-        network_config.listen_port = args.port;
+    let mut network_config = NetworkConfig::default();
+    network_config.enabled = true;
+    network_config.listen_port = args.port;
+    network_config.security.tailscale_only = config.network.tailscale_only;
 
-        // Load security settings from config
-        network_config.security.tailscale_only = config.network.security.tailscale_only;
-        if network_config.security.tailscale_only {
-            tracing::info!("Tailscale-only mode enabled - will only accept connections from Tailscale network");
-        }
+    if network_config.security.tailscale_only {
+        tracing::info!(
+            "Tailscale-only mode enabled - will only accept connections from Tailscale network"
+        );
+    }
 
-        // Load bootstrap nodes from config
-        for node_str in &config.network.bootstrap_nodes {
-            match node_str.parse::<std::net::SocketAddr>() {
-                Ok(addr) => {
-                    network_config.discovery.bootstrap_nodes.push(addr);
-                    tracing::info!("Added bootstrap node: {}", addr);
-                }
-                Err(e) => {
-                    tracing::warn!("Invalid bootstrap node '{}': {}", node_str, e);
-                }
-            }
-        }
-
-        // Use custom node name if provided
-        if let Some(name) = args.node_name {
-            // We'll override the identity name after creation
-            tracing::info!("Using custom node name: {}", name);
-        }
-
-        let network_service = match NetworkService::new(network_config).await {
-            Ok(service) => {
-                // Start the network service
-                if let Err(e) = service.start().await {
-                    tracing::error!("Failed to start network service: {}", e);
-                    return Err(e.into());
-                }
-                tracing::info!("P2P network started - Node: {} ({})",
-                    service.identity.name,
-                    service.identity.uuid
-                );
-                Arc::new(service)
+    // Load bootstrap nodes from config
+    for node_str in &config.network.bootstrap_nodes {
+        match node_str.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                network_config.discovery.bootstrap_nodes.push(addr);
+                tracing::info!("Added bootstrap node: {}", addr);
             }
             Err(e) => {
-                tracing::error!("Failed to initialize network: {}", e);
+                tracing::warn!("Invalid bootstrap node '{}': {}", node_str, e);
+            }
+        }
+    }
+
+    // Use custom node name if provided
+    if let Some(ref name) = args.node_name {
+        tracing::info!("Using custom node name: {}", name);
+    }
+
+    let network_service = match NetworkService::new(network_config).await {
+        Ok(service) => {
+            if let Err(e) = service.start().await {
+                tracing::error!("Failed to start network service: {}", e);
                 return Err(e.into());
             }
-        };
-
-        UfmServer::with_network(
-            policy,
-            config.name.clone(),
-            config.version.clone(),
-            BUILD_NUMBER.to_string(),
-            network_service.clone(),
-        )
-    } else {
-        UfmServer::new(
-            policy,
-            config.name.clone(),
-            config.version.clone(),
-            BUILD_NUMBER.to_string(),
-        )
+            tracing::info!(
+                "P2P network started - Node: {} ({})",
+                service.identity.name,
+                service.identity.uuid
+            );
+            Arc::new(service)
+        }
+        Err(e) => {
+            tracing::error!("Failed to initialize network: {}", e);
+            return Err(e.into());
+        }
     };
+
+    let ufm_server = UfmServer::with_network(
+        policy,
+        config.name.clone(),
+        config.version.clone(),
+        BUILD_NUMBER.to_string(),
+        network_service.clone(),
+    );
 
     // Wire up the tool executor for handling incoming remote tool requests
     if let Some(ref network) = ufm_server.state.network {
-        network.peers.set_tool_executor(ufm_server.tool_executor()).await;
+        network
+            .peers
+            .set_tool_executor(ufm_server.tool_executor())
+            .await;
         tracing::debug!("Tool executor wired up for remote tool requests");
     }
 
     // Check for updates on startup
-    // Auto-apply in daemon mode, just notify in MCP mode
     let update_config = update::UpdateConfig::default();
-    update::check_on_startup(&update_config, args.daemon).await;
+    update::check_on_startup(&update_config, args.no_stdio).await;
 
-    // Spawn background update checker (only useful in daemon mode for periodic checks)
+    // Spawn background update checker
     let _update_handle = update::spawn_update_checker(update_config);
 
-    // Daemon mode: run P2P network only, no MCP server
-    if args.daemon {
-        if !args.network {
-            eprintln!("Error: --daemon requires --network flag");
-            std::process::exit(1);
+    // Create shared server handle
+    let ufm_server = Arc::new(ufm_server);
+
+    // Start HTTP server for MCP requests
+    let http_router = create_http_router(ufm_server.clone());
+    let http_addr: SocketAddr = format!("127.0.0.1:{}", args.port).parse()?;
+
+    tracing::info!("Starting HTTP MCP server on http://{}", http_addr);
+
+    let http_server = axum::serve(
+        tokio::net::TcpListener::bind(http_addr).await?,
+        http_router,
+    );
+
+    // Print startup message
+    let node_name = ufm_server
+        .state
+        .network
+        .as_ref()
+        .map(|n| n.identity.name.as_str())
+        .unwrap_or("unknown");
+
+    println!("UFM v{} started", full_version());
+    println!("  Node: {}", node_name);
+    println!("  P2P:  port {}", args.port);
+    println!("  HTTP: http://127.0.0.1:{}/mcp", args.port);
+    if !args.no_stdio {
+        println!("  MCP:  stdio (for Claude Desktop)");
+    }
+    println!();
+
+    if args.no_stdio {
+        // Service mode: just run HTTP + P2P, no stdio
+        tracing::info!("Running in service mode (no stdio)");
+
+        tokio::select! {
+            result = http_server => {
+                if let Err(e) = result {
+                    tracing::error!("HTTP server error: {}", e);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Shutdown signal received");
+            }
         }
+    } else {
+        // Full mode: run HTTP + P2P + stdio MCP
+        tracing::info!("UFM ready, accepting MCP connections via stdio and HTTP");
 
-        tracing::info!("Running in daemon mode (P2P network only)");
-        println!("UFM daemon started - Node: {}",
-            ufm_server.state.network.as_ref()
-                .map(|n| n.identity.name.as_str())
-                .unwrap_or("unknown"));
-        println!("Listening for P2P connections on port {}", args.port);
-        println!("Press Ctrl+C to stop");
+        // Clone for the stdio task
+        let stdio_server = ufm_server.clone();
 
-        // Wait for shutdown signal
-        tokio::signal::ctrl_c().await?;
-        tracing::info!("Shutdown signal received, stopping...");
-        return Ok(());
+        tokio::select! {
+            result = http_server => {
+                if let Err(e) = result {
+                    tracing::error!("HTTP server error: {}", e);
+                }
+            }
+            result = run_stdio_server(stdio_server) => {
+                if let Err(e) = result {
+                    tracing::error!("Stdio MCP server error: {}", e);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Shutdown signal received");
+            }
+        }
     }
 
-    tracing::info!("UFM ready, waiting for MCP client connection...");
-
-    // Run the MCP server
-    run_stdio_server(ufm_server).await?;
-
+    tracing::info!("UFM shutting down");
     Ok(())
 }

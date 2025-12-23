@@ -1,12 +1,12 @@
 [Unit]
-Description=UFM - Universal File Manager (P2P Daemon)
+Description=UFM - Universal File Manager
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=mithroll
-ExecStart=/home/mithroll/.local/bin/ufm --network --daemon --node-name goldshire
+ExecStart=/home/mithroll/.local/bin/ufm --no-stdio --node-name goldshire
 
 # Crash recovery - restart on failure with backoff
 Restart=on-failure

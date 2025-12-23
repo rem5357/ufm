@@ -119,6 +119,7 @@ impl ToolExecutor for LocalToolExecutor {
                 "ufm_status" => handle_status(self.state.clone(), params, &self.version, &self.build).await,
                 "ufm_read" => handle_read_file(self.state.clone(), params).await,
                 "ufm_stat" => handle_stat(self.state.clone(), params).await,
+                "ufm_dir_info" => handle_dir_info(self.state.clone(), params).await,
                 "ufm_list" => handle_list(self.state.clone(), params).await,
                 "ufm_exists" => handle_exists(self.state.clone(), params).await,
                 "ufm_search" => handle_search(self.state.clone(), params).await,
@@ -198,6 +199,7 @@ Archive paths use :: notation: /path/to/archive.zip::internal/path"#
             "ufm_status" => handle_status(self.state.clone(), args, &self.version, &self.build).await,
             "ufm_read" => handle_read_file(self.state.clone(), args).await,
             "ufm_stat" => handle_stat(self.state.clone(), args).await,
+            "ufm_dir_info" => handle_dir_info(self.state.clone(), args).await,
             "ufm_list" => handle_list(self.state.clone(), args).await,
             "ufm_exists" => handle_exists(self.state.clone(), args).await,
             "ufm_search" => handle_search(self.state.clone(), args).await,
@@ -246,6 +248,7 @@ pub fn get_tools() -> Vec<Tool> {
         // Read operations
         read_file_tool(),
         stat_tool(),
+        dir_info_tool(),
         list_tool(),
         exists_tool(),
         search_tool(),
@@ -356,6 +359,24 @@ fn stat_tool() -> Tool {
                 "path": {
                     "type": "string",
                     "description": "Path to get metadata for"
+                },
+                "node": node_param_schema()
+            },
+            "required": ["path"]
+        }),
+    )
+}
+
+fn dir_info_tool() -> Tool {
+    Tool::new(
+        "ufm_dir_info",
+        "Get directory information for cache validation: modification time and immediate child count. Supports remote nodes.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to get info for"
                 },
                 "node": node_param_schema()
             },
@@ -843,6 +864,11 @@ fn crawl_tool() -> Tool {
                     "type": "boolean",
                     "default": false,
                     "description": "Return only directories (for change detection)"
+                },
+                "collect_dir_metadata": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Collect directory metadata for future dir_check optimization. Enable ONLY for rescans, not initial scans."
                 }
             },
             "required": ["root"]
@@ -1449,6 +1475,38 @@ async fn handle_stat(state: Arc<ToolState>, args: Value) -> ToolResult {
     serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())
 }
 
+async fn handle_dir_info(state: Arc<ToolState>, args: Value) -> ToolResult {
+    // Check for remote routing
+    if let Some(result) = maybe_route_remote(&state, &args, "ufm_dir_info").await? {
+        return Ok(result);
+    }
+
+    let path: PathBuf = args["path"]
+        .as_str()
+        .ok_or("path is required")?
+        .into();
+
+    // Use stat to validate path with security policy
+    let metadata = state.file_manager.stat(&path).map_err(|e| e.to_string())?;
+
+    if !metadata.is_dir {
+        return Err(format!("Path is not a directory: {}", path.display()));
+    }
+
+    // Count immediate children
+    let entry_count = std::fs::read_dir(&path)
+        .map_err(|e| format!("Failed to read directory: {}", e))?
+        .count() as u32;
+
+    // Return directory info needed for cache validation
+    serde_json::to_string_pretty(&json!({
+        "path": path,
+        "fs_modified_at": metadata.modified,
+        "entry_count": entry_count
+    }))
+    .map_err(|e| e.to_string())
+}
+
 async fn handle_list(state: Arc<ToolState>, args: Value) -> ToolResult {
     // Check for remote routing
     if let Some(result) = maybe_route_remote(&state, &args, "ufm_list").await? {
@@ -1973,13 +2031,15 @@ async fn handle_crawl(state: Arc<ToolState>, args: Value) -> ToolResult {
     let dirs_only = args["dirs_only"].as_bool().unwrap_or(false);
     let max_depth = args["max_depth"].as_u64().map(|d| d as usize);
     let resume_token = args["resume_token"].as_str();
+    let collect_dir_metadata = args["collect_dir_metadata"].as_bool().unwrap_or(false);
 
     tracing::info!(
-        "ufm_crawl: root={}, batch_size={}, dirs_only={}, resume={}",
+        "ufm_crawl: root={}, batch_size={}, dirs_only={}, resume={}, collect_metadata={}",
         root.display(),
         batch_size,
         dirs_only,
-        resume_token.is_some()
+        resume_token.is_some(),
+        collect_dir_metadata
     );
 
     let skip_patterns: Vec<glob::Pattern> = args["skip_patterns"]
@@ -1998,6 +2058,7 @@ async fn handle_crawl(state: Arc<ToolState>, args: Value) -> ToolResult {
         skip_patterns,
         max_depth,
         dirs_only,
+        collect_dir_metadata,
     };
 
     let crawl_start = std::time::Instant::now();

@@ -97,6 +97,10 @@ futures = "0.3"
 # HTTP client for auto-update
 reqwest = { version = "0.12", features = ["json"] }
 
+# HTTP server for MCP transport
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
 # Platform-specific features
 [target.'cfg(unix)'.dependencies]
 xattr = "1.3"                      # Extended attributes on Unix
