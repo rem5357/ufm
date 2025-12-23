@@ -681,7 +681,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_router,
     );
 
-    // Print startup message
+    // Print startup message to stderr (stdout is reserved for MCP JSON-RPC)
     let node_name = ufm_server
         .state
         .network
@@ -689,14 +689,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|n| n.identity.name.as_str())
         .unwrap_or("unknown");
 
-    println!("UFM v{} started", full_version());
-    println!("  Node: {}", node_name);
-    println!("  P2P:  port {}", args.port);
-    println!("  HTTP: http://127.0.0.1:{}/mcp", args.port);
+    eprintln!("UFM v{} started", full_version());
+    eprintln!("  Node: {}", node_name);
+    eprintln!("  P2P:  port {}", args.port);
+    eprintln!("  HTTP: http://127.0.0.1:{}/mcp", args.port);
     if !args.no_stdio {
-        println!("  MCP:  stdio (for Claude Desktop)");
+        eprintln!("  MCP:  stdio (for Claude Desktop)");
     }
-    println!();
+    eprintln!();
 
     if args.no_stdio {
         // Service mode: just run HTTP + P2P, no stdio
